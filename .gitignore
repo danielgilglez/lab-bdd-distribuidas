@@ -45,3 +45,6 @@ Desktop.ini
 *.key
 *.cert
 .env.local
+
+.codegraph/
+.cursor/

@@ -21,7 +21,7 @@ también **Docker** en `lab-bdd-docker/`).
 ## Estructura del proyecto
 
 ```
-Fase/
+. (raíz del proyecto)
 ├── lab-bdd-vagrant/          ← Vagrant + VirtualBox (implementación principal)
 │   ├── Vagrantfile           → 6 nodos: master, slave, multimaster, shard A/B, spider
 │   ├── scripts/
@@ -36,7 +36,11 @@ Fase/
 ├── lab-bdd-docker/           ← Versión alternativa con Docker Compose
 ├── markdown/                 → 11 fases documentadas del laboratorio (markdown)
 ├── pdfs/                     → Versiones PDF del mismo contenido
-└── pyproject.toml            → Proyecto Python auxiliar (uv)
+├── main.py                   → Script Python para convertir PDFs a Markdown (MarkItDown)
+├── pyproject.toml            → Configuración del proyecto Python (uv)
+├── uv.lock                   → Lockfile de dependencias de Python (uv)
+├── AGENTS.md                 → Memoria persistente y preferencias para agentes de IA
+└── GUIA_RAPIDA_LABORATORIO.md → Guía de referencia rápida y resumen de las 12 fases (SSoT)
 ```
 
 ---
@@ -101,9 +105,9 @@ Incluyen instrucciones de importación en `exports/IMPORTAR-EN-VIRTUALBOX.md`.
 
 ## Documentación
 
-Las 11 fases del laboratorio están documentadas en `markdown/` y `pdfs/`,
-cubriendo desde la instalación de VirtualBox hasta la configuración de
-Spider y replicación multi-maestro.
+Para una comprensión rápida e integral del laboratorio, se recomienda leer la **[Guía de Referencia Rápida (GUIA_RAPIDA_LABORATORIO.md)](GUIA_RAPIDA_LABORATORIO.md)**, la cual consolida los objetivos, configuraciones clave y métodos de verificación de todas las fases (Fase 0 a Fase 11) en un formato condensado y de lectura rápida (Single Source of Truth).
+
+Las 11 fases detalladas del laboratorio están documentadas individualmente en `markdown/` y `pdfs/`, cubriendo desde la instalación de VirtualBox hasta la configuración de Spider y replicación multi-maestro.
 
 Los fixes y cambios realizados durante la implementación están en
 `lab-bdd-vagrant/docs/`:
