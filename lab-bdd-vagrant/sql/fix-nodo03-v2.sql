@@ -1,0 +1,4 @@
+STOP SLAVE;
+RESET SLAVE ALL;
+DROP DATABASE IF EXISTS lab_bdd;
+SOURCE /vagrant/nodo03_dump.sql;

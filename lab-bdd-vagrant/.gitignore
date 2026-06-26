@@ -1,0 +1,11 @@
+.vagrant-home/
+.vbox-home/
+.vbox-machines/
+.vagrant/
+
+# Exportaciones OVA (grandes, regenerables)
+exports/
+*.ova
+
+# Logs de provision
+*.log

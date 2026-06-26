@@ -1,0 +1,256 @@
+networks:
+  lab-bdd-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.56.0/24
+
+services:
+  # ================================================================
+  # bdd-nodo01 — MAESTRO de replicación física (Fase 10)
+  # IP: 192.168.56.101 | server_id: 1
+  # ================================================================
+  bdd-nodo01:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo01
+    hostname: bdd-nodo01
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.101
+    environment:
+      NODE_NAME: bdd-nodo01
+      NODE_IP: 192.168.56.101
+      NODE_ID: 1
+      ROLE: master
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo01:/config/nodo01
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - ./scripts:/scripts
+      - nodo01-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ================================================================
+  # bdd-nodo02 — ESCLAVO de replicación física (Fase 10)
+  # IP: 192.168.56.102 | server_id: 2 | read_only = ON
+  # ================================================================
+  bdd-nodo02:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo02
+    hostname: bdd-nodo02
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.102
+    environment:
+      NODE_NAME: bdd-nodo02
+      NODE_IP: 192.168.56.102
+      NODE_ID: 2
+      ROLE: slave
+      MASTER_IP: 192.168.56.101
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo02:/config/nodo02
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - nodo02-data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      bdd-nodo01:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ================================================================
+  # bdd-nodo03 — REPLICACIÓN LÓGICA MULTI-MAESTRO (Fase 11)
+  # IP: 192.168.56.103 | server_id: 3
+  # ================================================================
+  bdd-nodo03:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo03
+    hostname: bdd-nodo03
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.103
+    environment:
+      NODE_NAME: bdd-nodo03
+      NODE_IP: 192.168.56.103
+      NODE_ID: 3
+      ROLE: multimaster
+      MASTER_IP: 192.168.56.101
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo03:/config/nodo03
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - nodo03-data:/var/lib/mysql
+    ports:
+      - "3308:3306"
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      bdd-nodo01:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ================================================================
+  # bdd-nodo04 — SHARD A / FRAGMENTACIÓN HORIZONTAL (Fase 13)
+  # IP: 192.168.56.104 | server_id: 4
+  # Almacena: region IN ('norte','este')
+  # También: V_productos_basico (fragmentación vertical, Fase 14)
+  # ================================================================
+  bdd-nodo04:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo04
+    hostname: bdd-nodo04
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.104
+    environment:
+      NODE_NAME: bdd-nodo04
+      NODE_IP: 192.168.56.104
+      NODE_ID: 4
+      ROLE: shard
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo04:/config/nodo04
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - nodo04-data:/var/lib/mysql
+    ports:
+      - "3309:3306"
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ================================================================
+  # bdd-nodo05 — SHARD B / FRAGMENTACIÓN HORIZONTAL (Fase 13)
+  # IP: 192.168.56.105 | server_id: 5
+  # Almacena: region IN ('sur','oeste')
+  # También: V_productos_detalle (fragmentación vertical, Fase 14)
+  # ================================================================
+  bdd-nodo05:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo05
+    hostname: bdd-nodo05
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.105
+    environment:
+      NODE_NAME: bdd-nodo05
+      NODE_IP: 192.168.56.105
+      NODE_ID: 5
+      ROLE: shard
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo05:/config/nodo05
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - nodo05-data:/var/lib/mysql
+    ports:
+      - "3310:3306"
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ================================================================
+  # bdd-nodo06 — COORDINADOR SPIDER (Fases 14-16)
+  # IP: 192.168.56.106 | server_id: 6
+  # Motor Spider: tablas federadas a nodo04 y nodo05
+  # ================================================================
+  bdd-nodo06:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bdd-nodo06
+    hostname: bdd-nodo06
+    networks:
+      lab-bdd-net:
+        ipv4_address: 192.168.56.106
+    environment:
+      NODE_NAME: bdd-nodo06
+      NODE_IP: 192.168.56.106
+      NODE_ID: 6
+      ROLE: spider
+      MARIADB_ROOT_PASSWORD: LabAdmin_2025!
+    volumes:
+      - ./config/nodo06:/config/nodo06
+      - ./config/99-lab-charset.cnf:/config/99-lab-charset.cnf
+      - ./config/99-lab-logs.cnf:/config/99-lab-logs.cnf
+      - ./sql:/docker-entrypoint-initdb.d
+      - nodo06-data:/var/lib/mysql
+    ports:
+      - "3311:3306"
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      bdd-nodo04:
+        condition: service_healthy
+      bdd-nodo05:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  nodo01-data:
+  nodo02-data:
+  nodo03-data:
+  nodo04-data:
+  nodo05-data:
+  nodo06-data:

@@ -1,0 +1,7 @@
+SET GLOBAL gtid_slave_pos = '1-1-28';
+CHANGE MASTER TO
+  MASTER_HOST='192.168.56.101',
+  MASTER_USER='repl_user',
+  MASTER_PASSWORD='ReplUser_2025!',
+  MASTER_USE_GTID=slave_pos;
+START SLAVE;

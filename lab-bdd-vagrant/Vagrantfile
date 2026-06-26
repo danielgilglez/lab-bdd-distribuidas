@@ -1,0 +1,161 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Laboratorio BDD — VirtualBox + Vagrant
+# Sustituye las 11 fases manuales por un solo `vagrant up`.
+# Requiere: Vagrant 2.4+ , VirtualBox 7.0+
+#
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+  config.vm.box_check_update = false
+  config.vm.boot_timeout = 900
+  config.ssh.forward_agent = false
+  config.ssh.insert_key = false
+  config.ssh.username = Dir.glob(".vagrant/machines/*/virtualbox/id").any? ? "bddadmin" : "vagrant"
+  config.vm.synced_folder ".", "/vagrant", type: "virtualbox"
+
+  # ==============================================================
+  # Configuración base común a todas las VMs
+  # ==============================================================
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 1536
+    vb.cpus = 2
+    vb.gui = true
+    vb.linked_clone = false
+    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]
+    vb.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
+    vb.customize ["modifyvm", :id, "--nictype1", "virtio"]
+    vb.customize ["modifyvm", :id, "--nictype2", "virtio"]
+  end
+
+  config.vm.provision "shell",
+    path: "scripts/provision-base.sh",
+    env: {
+      "MARIADB_ROOT_PASSWORD" => "LabAdmin_2025!",
+      "REPL_PASSWORD" => "ReplUser_2025!"
+    }
+
+  # ==============================================================
+  # bdd-nodo01 — MAESTRO replicación física (Fase 10)
+  # IP: 192.168.56.101 | server_id: 1 | binlog ROW + GTID
+  # ==============================================================
+  config.vm.define "bdd-nodo01", primary: true do |vm|
+    vm.vm.hostname = "bdd-nodo01"
+    vm.vm.network "private_network", ip: "192.168.56.101", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo01"
+      vb.memory = 2048
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo01",
+        "NODE_IP" => "192.168.56.101",
+        "NODE_ID" => "1",
+        "ROLE" => "master"
+      }
+  end
+
+  # ==============================================================
+  # bdd-nodo02 — ESCLAVO replicación física (Fase 10)
+  # IP: 192.168.56.102 | server_id: 2 | read_only = ON
+  # ==============================================================
+  config.vm.define "bdd-nodo02" do |vm|
+    vm.vm.hostname = "bdd-nodo02"
+    vm.vm.network "private_network", ip: "192.168.56.102", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo02"
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo02",
+        "NODE_IP" => "192.168.56.102",
+        "NODE_ID" => "2",
+        "ROLE" => "slave",
+        "MASTER_IP" => "192.168.56.101"
+      }
+  end
+
+  # ==============================================================
+  # bdd-nodo03 — MULTI-MAESTRO replicación lógica (Fase 11)
+  # IP: 192.168.56.103 | server_id: 3 | binlog + GTID
+  # ==============================================================
+  config.vm.define "bdd-nodo03" do |vm|
+    vm.vm.hostname = "bdd-nodo03"
+    vm.vm.network "private_network", ip: "192.168.56.103", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo03"
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo03",
+        "NODE_IP" => "192.168.56.103",
+        "NODE_ID" => "3",
+        "ROLE" => "multimaster",
+        "MASTER_IP" => "192.168.56.101"
+      }
+  end
+
+  # ==============================================================
+  # bdd-nodo04 — SHARD A (Fase 13)
+  # IP: 192.168.56.104 | server_id: 4 | region IN ('norte','este')
+  # ==============================================================
+  config.vm.define "bdd-nodo04" do |vm|
+    vm.vm.hostname = "bdd-nodo04"
+    vm.vm.network "private_network", ip: "192.168.56.104", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo04"
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo04",
+        "NODE_IP" => "192.168.56.104",
+        "NODE_ID" => "4",
+        "ROLE" => "shard"
+      }
+  end
+
+  # ==============================================================
+  # bdd-nodo05 — SHARD B (Fase 13)
+  # IP: 192.168.56.105 | server_id: 5 | region IN ('sur','oeste')
+  # ==============================================================
+  config.vm.define "bdd-nodo05" do |vm|
+    vm.vm.hostname = "bdd-nodo05"
+    vm.vm.network "private_network", ip: "192.168.56.105", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo05"
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo05",
+        "NODE_IP" => "192.168.56.105",
+        "NODE_ID" => "5",
+        "ROLE" => "shard"
+      }
+  end
+
+  # ==============================================================
+  # bdd-nodo06 — COORDINADOR SPIDER (Fases 14-16)
+  # IP: 192.168.56.106 | server_id: 6 | ha_spider
+  # ==============================================================
+  config.vm.define "bdd-nodo06" do |vm|
+    vm.vm.hostname = "bdd-nodo06"
+    vm.vm.network "private_network", ip: "192.168.56.106", netmask: "255.255.255.0"
+    vm.vm.provider "virtualbox" do |vb|
+      vb.name = "bdd-nodo06"
+    end
+    vm.vm.provision "shell",
+      path: "scripts/provision-role.sh",
+      env: {
+        "NODE_NAME" => "bdd-nodo06",
+        "NODE_IP" => "192.168.56.106",
+        "NODE_ID" => "6",
+        "ROLE" => "spider"
+      }
+  end
+end

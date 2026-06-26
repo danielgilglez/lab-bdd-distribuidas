@@ -1,0 +1,10 @@
+[mariadb]
+server_id = 5
+log_bin = /var/log/mysql/mariadb-bin
+binlog_format = ROW
+expire_logs_days = 7
+max_binlog_size = 100M
+binlog_annotate_row_events = ON
+gtid_domain_id = 1
+log_slave_updates = ON
+skip_name_resolve = ON

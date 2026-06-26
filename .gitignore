@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.whl
+
+# Virtual environments
+.venv
+.venv*/
+.env
+
+# Vagrant
+.vagrant/
+.vagrant-home/
+.vbox-home/
+.vbox-machines/
+*.vmdk
+*.vdi
+
+# Exportacion OVA (regenerable, binario pesado)
+*.ova
+exports/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# IDE / Editor
+.vscode/
+.idea/
+*.sublime-*
+
+# Logs
+*.log
+
+# Secrets (no subir nunca)
+*.pem
+*.key
+*.cert
+.env.local

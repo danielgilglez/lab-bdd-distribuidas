@@ -1,0 +1,14 @@
+[mariadb]
+server_id = 2
+relay_log = /var/log/mysql/mariadb-relay-bin
+relay_log_index = /var/log/mysql/mariadb-relay-bin.index
+relay_log_purge = ON
+log_bin = /var/log/mysql/mariadb-bin
+binlog_format = ROW
+expire_logs_days = 7
+max_binlog_size = 100M
+binlog_annotate_row_events = ON
+log_slave_updates = ON
+gtid_domain_id = 1
+read_only = ON
+skip_name_resolve = ON
