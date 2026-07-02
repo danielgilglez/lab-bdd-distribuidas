@@ -12,3 +12,13 @@
 * Includes a Python script (`main.py`) powered by `uv` and `MarkItDown` to convert 13 PDF-based laboratory phases into Markdown.
 * Converted Markdown files and the combined `FASE_COMPLETA.md` reside in the `markdown/` folder.
 * The Vagrant VMs are configured with the `bddadmin` user and default credentials for MariaDB root and replication users.
+* Root MariaDB password: `LabAdmin_2025!`; Replication user: `repl_user` / `ReplUser_2025!`
+* SSH user in Vagrantfile is now hardcoded to `"vagrant"` (dynamic detection was buggy)
+* `vb.gui = false` globally in Vagrantfile to avoid slow boot SSH timeouts
+* `mariadb-plugin-spider` package installed separately via `provision-role.sh` for the spider role
+* Spider uses `CREATE SERVER` + `srv "name"` syntax (not inline host/port/user/password in COMMENT)
+* Partitioned Spider tables require PK to include partition column; UNIQUE constraints must be replaced with INDEX
+* Shard provisioning skips `02-data.sql`; uses `04-data-shard-a.sql` / `04-data-shard-b.sql` per node
+* Demo/fix/test SQL scripts are skipped for non-master roles (provision-role.sh filtering)
+* All 6 VMs (bdd-nodo01 through bdd-nodo06) exist and are currently provisioned and running
+* See `docs/08-spider-setup.md` for Spider architecture and troubleshooting

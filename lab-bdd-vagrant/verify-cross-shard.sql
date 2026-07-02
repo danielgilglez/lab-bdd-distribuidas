@@ -1,0 +1,15 @@
+SELECT '=== CONSULTA DISTRIBUIDA POR REGION ===' AS '';
+SELECT c.region, COUNT(DISTINCT c.id) AS clientes, COUNT(DISTINCT p.id) AS pedidos, COUNT(dp.id) AS detalle
+FROM clientes c
+JOIN pedidos p ON c.id = p.cliente_id
+JOIN detalle_pedidos dp ON p.id = dp.pedido_id
+GROUP BY c.region ORDER BY c.region;
+
+SELECT '=== TOTAL CROSS-SHARD ===' AS '';
+SELECT COUNT(*) AS total FROM clientes;
+
+SELECT '=== INFORMACION DE PARTICIONES SPIDER ===' AS '';
+SELECT TABLE_NAME, PARTITION_NAME, PARTITION_ORDINAL_POSITION, PARTITION_METHOD, PARTITION_DESCRIPTION, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA='lab_bdd' AND TABLE_NAME IN ('clientes','pedidos','detalle_pedidos')
+ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION;

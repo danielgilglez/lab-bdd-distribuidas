@@ -98,6 +98,8 @@ skip_name_resolve = ON
 CNF
         ;;
     spider)
+        echo "[$NODE_NAME] Instalando plugin MariaDB Spider..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-plugin-spider 2>/dev/null || true
         cat > /etc/mysql/mariadb.conf.d/60-replication.cnf << CNF
 [mariadb]
 server_id = $NODE_ID
@@ -197,19 +199,45 @@ else
         echo "[$NODE_NAME] Ejecutando scripts SQL desde $SQL_DIR..."
         for f in "$SQL_DIR"/*.sql; do
             if [ -f "$f" ]; then
-                echo "  -> $(basename "$f")"
-                case "$(basename "$f")" in
-                    04-spider-setup.sql)
-                        if [ "$ROLE" = "spider" ]; then
-                            mysql -u root -p"$MARIADB_ROOT_PASSWORD" < "$f"
-                        else
-                            echo "     (saltado, solo spider)"
+                BASENAME=$(basename "$f")
+                SKIP=0
+
+                case "$BASENAME" in
+                    02-data.sql)
+                        # Data completo solo en master; shards/spider usan scripts específicos
+                        if [ "$ROLE" != "master" ]; then
+                            echo "     (saltado $BASENAME, solo master)"
+                            SKIP=1
                         fi
                         ;;
-                    *)
-                        mysql -u root -p"$MARIADB_ROOT_PASSWORD" < "$f"
+                    04-data-shard-a.sql)
+                        if [ "$ROLE" != "shard" ] || [ "$NODE_NAME" != "bdd-nodo04" ]; then
+                            echo "     (saltado $BASENAME, solo shard A)"
+                            SKIP=1
+                        fi
+                        ;;
+                    04-data-shard-b.sql)
+                        if [ "$ROLE" != "shard" ] || [ "$NODE_NAME" != "bdd-nodo05" ]; then
+                            echo "     (saltado $BASENAME, solo shard B)"
+                            SKIP=1
+                        fi
+                        ;;
+                    04-spider-setup.sql)
+                        if [ "$ROLE" != "spider" ]; then
+                            echo "     (saltado $BASENAME, solo spider)"
+                            SKIP=1
+                        fi
+                        ;;
+                    05-particionamiento.sql | check-*.sql | fix-*.sql | test-*.sql)
+                        echo "     (saltado $BASENAME, demo/verificacion/fix)"
+                        SKIP=1
                         ;;
                 esac
+
+                if [ "$SKIP" -eq 0 ]; then
+                    echo "  -> $BASENAME"
+                    mysql -u root -p"$MARIADB_ROOT_PASSWORD" < "$f"
+                fi
             fi
         done
     else
