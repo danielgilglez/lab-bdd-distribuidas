@@ -1,6 +1,6 @@
 # Guía de Referencia Rápida — Laboratorio de Bases de Datos Distribuidas (MariaDB)
 
-Este documento sirve como la **Única Fuente de Verdad (Single Source of Truth - SSoT)** del laboratorio. Consolida, resume y estructura las 12 fases académicas (Fase 0 a Fase 11) en un formato de lectura rápida y alta densidad de información, diseñado para ser consumido eficientemente tanto por humanos como por agentes de Inteligencia Artificial.
+Este documento sirve como la **Única Fuente de Verdad (Single Source of Truth - SSoT)** del laboratorio. Consolida, resume y estructura las 17 fases académicas (Fase 0 a Fase 16) en un formato de lectura rápida y alta densidad de información, diseñado para ser consumido eficientemente tanto por humanos como por agentes de Inteligencia Artificial.
 
 ---
 
@@ -11,14 +11,15 @@ Este documento sirve como la **Única Fuente de Verdad (Single Source of Truth -
 * **Red Host-Only de VirtualBox**: `192.168.56.0/24` (IP del Host: `192.168.56.1`, DHCP desactivado).
 * **Usuario del Sistema Operativo**: `bddadmin` (Contraseña: `bddadmin`, con privilegios sudo).
 
-| Nodo | IP Estática | Rol en MariaDB | server_id | Características Clave | Fase |
-|---|---|---|---|---|---|
+| Nodo | IP Estática | Rol en MariaDB | server_id | Características Clave | Fases |
+|---|---|---|---|---|---|---|
 | **bdd-nodo01** | `192.168.56.101` | **Master** | `1` | Binlog ROW, GTID activo, lectura/escritura | Fase 10 |
 | **bdd-nodo02** | `192.168.56.102` | **Slave** | `2` | Replica física de nodo01, `read_only = ON` | Fase 10 |
 | **bdd-nodo03** | `192.168.56.103` | **Multimaster** | `3` | Par síncrono (Galera) o réplica lógica bidireccional | Fase 11 |
-| **bdd-nodo04** | `192.168.56.104` | **Shard A** | `4` | Fragmento Horizontal (Norte/Este) + Vert. Básico | Fase 13 |
-| **bdd-nodo05** | `192.168.56.105` | **Shard B** | `5` | Fragmento Horizontal (Sur/Oeste) + Vert. Detalle | Fase 13 |
-| **bdd-nodo06** | `192.168.56.106` | **Spider Coordinator** | `6` | Motor Spider activo, no almacena datos locales | Fases 14-16 |
+| **bdd-nodo04** | `192.168.56.104` | **Shard A** | `4` | Fragmento Horizontal (Norte/Este) + Vert. Básico | Fases 13-16 |
+| **bdd-nodo05** | `192.168.56.105` | **Shard B** | `5` | Fragmento Horizontal (Sur/Oeste) + Vert. Detalle | Fases 13-16 |
+| **bdd-nodo06** | `192.168.56.106** | **Spider Coordinator** | `6` | Motor Spider activo, no almacena datos locales | Fases 14-16 |
+| **bdd-nodo07** | `192.168.56.107` | **Cliente** | — | Estación cliente ligera sin MariaDB, solo `mariadb-client` | Fase 16 |
 
 ### Credenciales de MariaDB
 
@@ -42,7 +43,7 @@ El laboratorio utiliza un esquema relacional básico de comercio electrónico co
 
 ---
 
-## ⏱️ Resumen Ejecutivo de las Fases (0 a 11)
+## ⏱️ Resumen Ejecutivo de las Fases (0 a 16)
 
 ### Fase 0 — Planeación y Diseño del Laboratorio
 * **Objetivo**: Diseñar la topología de red, direccionamiento IP, dimensionamiento de hardware y plan de crecimiento (de 2 a 6 nodos).
@@ -199,6 +200,118 @@ El laboratorio utiliza un esquema relacional básico de comercio electrónico co
   * `SHOW STATUS LIKE 'wsrep_cluster_status';` devuelve `Primary`.
   * `SHOW STATUS LIKE 'wsrep_local_state_comment';` devuelve `Synced`.
   * Al intentar actualizar la misma fila simultáneamente en dos nodos, el nodo perdedor realiza un rollback automático y lanza un error de deadlock (`Deadlock found when trying to get lock`). Snapshot: `fase11-completa`.
+
+### Fase 12 — Particionamiento de Tablas en MariaDB
+* **Objetivo**: Demostrar los 4 tipos de particionamiento nativo de MariaDB (RANGE, LIST, HASH, KEY) en el esquema `lab_particiones` sobre `bdd-nodo01`, como base conceptual para la fragmentación distribuida.
+* **Conceptos clave**: Particionamiento nativo vs. fragmentación distribuida, poda de particiones (partition pruning), claves primarias compuestas, incompatibilidad con FK.
+* **Comandos clave (`bdd-nodo01`)**:
+  ```sql
+  CREATE TABLE ventas_range (
+    id INT, producto VARCHAR(50), cantidad INT, fecha DATE
+  ) PARTITION BY RANGE (YEAR(fecha)) (
+    PARTITION p_antes2024 VALUES LESS THAN (2024),
+    PARTITION p_2024 VALUES LESS THAN (2025),
+    PARTITION p_futuro VALUES LESS THAN MAXVALUE
+  );
+  ```
+  ```sql
+  SELECT TABLE_NAME, PARTITION_NAME, TABLE_ROWS
+  FROM INFORMATION_SCHEMA.PARTITIONS
+  WHERE TABLE_SCHEMA = 'lab_particiones';
+  ```
+* **Verificación**: `EXPLAIN SELECT * FROM ventas_range WHERE fecha = '2025-06-15'` muestra `partitions p_2025` (poda). Las filas insertadas con distintas regiones caen en la partición LIST correcta. Snapshot: `fase12-completa`.
+
+### Fase 13 — Fragmentación Horizontal
+* **Objetivo**: Crear `bdd-nodo04` (Shard A: Norte/Este) y `bdd-nodo05` (Shard B: Sur/Oeste) como clones enlazados, distribuyendo `clientes`, `pedidos` y `detalle_pedidos` por región.
+* **Conceptos clave**: Clon enlazado (linked clone), `mysqldump --where`, fragmentación derivada, co-localización, completitud/disjunción/reconstrucción.
+* **Comandos clave**:
+  ```bash
+  # mysqldump con filtro por región
+  mysqldump --where="region IN ('norte','este')" lab_bdd clientes > clientes_shard_a.sql
+  mysqldump --where="region IN ('sur','oeste')" lab_bdd clientes > clientes_shard_b.sql
+  ```
+  ```sql
+  -- Reconstrucción vía UNION ALL
+  SELECT COUNT(*) FROM (
+    SELECT * FROM bdd-nodo04.lab_bdd.clientes
+    UNION ALL
+    SELECT * FROM bdd-nodo05.lab_bdd.clientes
+  ) AS total;
+  ```
+* **Verificación**: `SELECT region, COUNT(*) FROM clientes GROUP BY region` en cada shard devuelve solo sus regiones. La suma de filas de ambos shards es igual al total original. Snapshot: `fase13-completa`.
+
+### Fase 14 — Fragmentación Vertical
+* **Objetivo**: Distribuir `productos` verticalmente entre `nodo04` (columnas básicas) y `nodo05` (columnas de detalle), y provisionar `bdd-nodo06` como coordinador Spider.
+* **Conceptos clave**: Fragmentación vertical (completitud/disjunción/reconstrucción por JOIN), Spider Storage Engine, `CREATE SERVER`, `LIST COLUMNS (region)`, poda automática.
+* **Comandos clave**:
+  ```sql
+  -- En nodo06: instalar Spider
+  INSTALL SONAME 'ha_spider';
+  
+  -- Registrar servidores remotos
+  CREATE SERVER shard_a FOREIGN DATA WRAPPER mysql
+    OPTIONS (HOST '192.168.56.104', DATABASE 'lab_bdd', USER 'lab_admin', PASSWORD 'LabAdmin_2025!');
+  
+  -- Tabla Spider particionada
+  CREATE TABLE clientes (
+    id INT, nombre VARCHAR(50), region VARCHAR(10), ...
+  ) ENGINE=Spider
+  PARTITION BY LIST COLUMNS (region) (
+    PARTITION p_norte VALUES IN ('norte') COMMENT = 'srv "shard_a"',
+    PARTITION p_este  VALUES IN ('este')  COMMENT = 'srv "shard_a"',
+    PARTITION p_sur   VALUES IN ('sur')   COMMENT = 'srv "shard_b"',
+    PARTITION p_oeste VALUES IN ('oeste') COMMENT = 'srv "shard_b"'
+  );
+  ```
+* **Verificación**: `SELECT * FROM clientes WHERE region = 'norte'` desde nodo06 muestra solo filas del shard A. `EXPLAIN` confirma poda a `p_norte`. Snapshot: `fase14-completa`.
+
+### Fase 15 — Fragmentación Híbrida
+* **Objetivo**: Optimizar consultas distribuidas con índices compuestos, predicate pushdown y proyección de columnas. Crear objetos de negocio que encapsulan la distribución.
+* **Conceptos clave**: Fragmentación híbrida inter-tabla, grado de localidad (8 consultas H-1 a H-8), predicate pushdown, proyección de columnas, fan-out de escrituras.
+* **Comandos clave**:
+  ```sql
+  -- Índice compuesto en shards
+  CREATE INDEX idx_pedidos_cliente_region ON pedidos(cliente_id, region);
+  
+  -- Vista de negocio transparente
+  CREATE VIEW reporte_pedidos_detallado AS
+  SELECT c.nombre, c.region, p.fecha_pedido, dp.cantidad, pr.nombre AS producto
+  FROM clientes c
+  JOIN pedidos p ON c.id = p.cliente_id
+  JOIN detalle_pedidos dp ON p.id = dp.pedido_id
+  JOIN v_productos_completo pr ON dp.producto_id = pr.id;
+  
+  -- Procedimiento regional
+  CREATE PROCEDURE consulta_regional(IN p_region VARCHAR(10))
+  BEGIN
+    SELECT * FROM reporte_pedidos_detallado WHERE region = p_region;
+  END;
+  ```
+* **Verificación**: `CALL consulta_regional('norte')` desde nodo06 devuelve resultados sin que el cliente sepa que los datos están en 4 nodos distintos. Snapshot: `fase15-completa`.
+
+### Fase 16 — Consultas Distribuidas
+* **Objetivo**: Formalizar el algoritmo de procesamiento distribuido en 4 fases, implementar semijoin (Bernstein-Chiu), y provisionar `bdd-nodo07` como estación cliente que prueba la transparencia total.
+* **Conceptos clave**: Algoritmo de 4 fases (descomposición, localización, optimización global, ejecución), semijoin distribuida, `analizar_consulta()`, estación cliente ligera.
+* **Comandos clave**:
+  ```sql
+  -- Procedimiento de análisis de consulta
+  CREATE PROCEDURE analizar_consulta(
+    IN p_region VARCHAR(10),
+    IN p_detalle BOOLEAN
+  )
+  BEGIN
+    -- Estima fragmentos involucrados, filas esperadas, bytes y grado de localidad
+  END;
+  
+  -- Semijoin manual (Bernstein-Chiu)
+  SELECT id FROM nodo04.clientes WHERE region = 'norte';  -- paso 1
+  SELECT * FROM nodo04.pedidos WHERE cliente_id IN (...); -- paso 2
+  ```
+* **Configuración de bdd-cliente (`/etc/hosts`)**:
+  ```text
+  192.168.56.106 bdd-nodo06
+  ```
+* **Verificación**: `mysql -h bdd-nodo06 -u app_final -p -e "CALL consulta_regional('sur');"` desde `bdd-nodo07` devuelve datos sin que el cliente conozca la topología interna. Snapshot: `fase16-completa`.
 
 ---
 

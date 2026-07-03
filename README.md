@@ -34,7 +34,7 @@ también **Docker** en `lab-bdd-docker/`).
 │   ├── docs/                 → Documentación del proceso y fixes
 │   └── exports/              → OVAs exportados (ignorados por git)
 ├── lab-bdd-docker/           ← Versión alternativa con Docker Compose
-├── markdown/                 → 11 fases documentadas del laboratorio (markdown)
+├── markdown/                 → 17 fases documentadas del laboratorio (markdown)
 ├── pdfs/                     → Versiones PDF del mismo contenido
 ├── main.py                   → Script Python para convertir PDFs a Markdown (MarkItDown)
 ├── pyproject.toml            → Configuración del proyecto Python (uv)
@@ -100,14 +100,15 @@ Incluyen instrucciones de importación en `exports/IMPORTAR-EN-VIRTUALBOX.md`.
 | bdd-nodo04 | 192.168.56.104 | **Shard A** | server_id=4, región norte/este |
 | bdd-nodo05 | 192.168.56.105 | **Shard B** | server_id=5, región sur/oeste |
 | bdd-nodo06 | 192.168.56.106 | **Spider** | server_id=6, coordinador de shards |
+| bdd-nodo07 | 192.168.56.107 | **Cliente** | estación cliente ligera, solo `mariadb-client` |
 
 ---
 
 ## Documentación
 
-Para una comprensión rápida e integral del laboratorio, se recomienda leer la **[Guía de Referencia Rápida (GUIA_RAPIDA_LABORATORIO.md)](GUIA_RAPIDA_LABORATORIO.md)**, la cual consolida los objetivos, configuraciones clave y métodos de verificación de todas las fases (Fase 0 a Fase 11) en un formato condensado y de lectura rápida (Single Source of Truth).
+Para una comprensión rápida e integral del laboratorio, se recomienda leer la **[Guía de Referencia Rápida (GUIA_RAPIDA_LABORATORIO.md)](GUIA_RAPIDA_LABORATORIO.md)**, la cual consolida los objetivos, configuraciones clave y métodos de verificación de todas las fases (Fase 0 a Fase 16) en un formato condensado y de lectura rápida (Single Source of Truth).
 
-Las 11 fases detalladas del laboratorio están documentadas individualmente en `markdown/` y `pdfs/`, cubriendo desde la instalación de VirtualBox hasta la configuración de Spider y replicación multi-maestro.
+Las 17 fases detalladas del laboratorio están documentadas individualmente en `markdown/` y `pdfs/`, cubriendo desde la instalación de VirtualBox hasta las consultas distribuidas con Spider y la estación cliente.
 
 Los fixes y cambios realizados durante la implementación están en
 `lab-bdd-vagrant/docs/`:
