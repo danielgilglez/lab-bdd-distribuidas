@@ -18,7 +18,7 @@ Este documento sirve como la **Única Fuente de Verdad (Single Source of Truth -
 | **bdd-nodo03** | `192.168.56.103` | **Multimaster** | `3` | Par síncrono (Galera) o réplica lógica bidireccional | Fase 11 |
 | **bdd-nodo04** | `192.168.56.104` | **Shard A** | `4` | Fragmento Horizontal (Norte/Este) + Vert. Básico | Fases 13-16 |
 | **bdd-nodo05** | `192.168.56.105` | **Shard B** | `5` | Fragmento Horizontal (Sur/Oeste) + Vert. Detalle | Fases 13-16 |
-| **bdd-nodo06** | `192.168.56.106** | **Spider Coordinator** | `6` | Motor Spider activo, no almacena datos locales | Fases 14-16 |
+| **bdd-nodo06** | `192.168.56.106` | **Spider Coordinator** | `6` | Motor Spider activo, no almacena datos locales | Fases 14-16 |
 | **bdd-nodo07** | `192.168.56.107` | **Cliente** | — | Estación cliente ligera sin MariaDB, solo `mariadb-client` | Fase 16 |
 
 ### Credenciales de MariaDB
@@ -29,6 +29,7 @@ Este documento sirve como la **Única Fuente de Verdad (Single Source of Truth -
 | **lab_admin** | `LabAdmin_2025!` | `localhost`, `%` | `ALL PRIVILEGES ON lab_bdd.*` |
 | **app_user** | `AppUser_2025!` | `localhost`, `%` | `SELECT, INSERT, UPDATE, DELETE ON lab_bdd.*` |
 | **repl_user** | `ReplUser_2025!` | `%` o IP específica | `REPLICATION SLAVE ON *.*` |
+| **app_final** | `AppFinal_2025!` | `192.168.56.1`, `192.168.56.107` | `SELECT, INSERT, UPDATE, DELETE ON lab_bdd.*` + `EXECUTE ON lab_bdd.*` |
 
 ---
 

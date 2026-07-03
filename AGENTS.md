@@ -7,7 +7,7 @@
 ## Learned Workspace Facts
 
 * The repository implements a Distributed Database Lab using MariaDB 10.x, automated with Vagrant/VirtualBox (under `lab-bdd-vagrant`) and alternatively with Docker Compose (under `lab-bdd-docker`).
-* The architecture consists of 6 distinct database nodes with static IPs in the range `192.168.56.101` to `192.168.56.106`: bdd-nodo01 (Master), bdd-nodo02 (Slave), bdd-nodo03 (Multimaster), bdd-nodo04 (Shard A), bdd-nodo05 (Shard B), and bdd-nodo06 (Spider coordinator).
+* The architecture consists of 6 database nodes + 1 client-only node with static IPs in the range `192.168.56.101` to `192.168.56.107`: bdd-nodo01 (Master), bdd-nodo02 (Slave), bdd-nodo03 (Multimaster), bdd-nodo04 (Shard A), bdd-nodo05 (Shard B), bdd-nodo06 (Spider coordinator), and bdd-nodo07 (bdd-cliente, client-only with `mariadb-client`).
 * **Nuance on Replication**: While the original laboratory guide (`markdown/Fase 11`) describes configuring a synchronous **MariaDB Galera Cluster** for `bdd-nodo01`, `bdd-nodo02`, and `bdd-nodo03`, the automated Vagrant and Docker implementations simplify this by using standard asynchronous/semi-synchronous replication with GTID (`MASTER_USE_GTID=slave_pos`) to reduce system overhead and simplify automation.
 * Includes a Python script (`main.py`) powered by `uv` and `MarkItDown` to convert PDF-based laboratory phases into Markdown.
 * Converted Markdown files and the combined `FASE_COMPLETA.md` reside in the `markdown/` folder.
@@ -26,6 +26,7 @@
 ## Resumen de Fases 12–16
 
 * **Fase 12 — Particionamiento de Tablas en MariaDB**: Crea el esquema `lab_particiones` con los 4 tipos de particionamiento nativo (RANGE, LIST, HASH, KEY) en `bdd-nodo01`. Sienta la base conceptual de la fragmentación distribuida. Incluye poda de particiones, mantenimiento y auditoría vía `INFORMATION_SCHEMA.PARTITIONS`.
+* **⚠️ ENUM vs VARCHAR en particionamiento**: MariaDB NO permite columnas `ENUM` como clave de particionamiento en `LIST COLUMNS` ni `RANGE COLUMNS` (error 1659). Todas las columnas usadas como partitioning key deben ser `VARCHAR`, `CHAR`, `DATE`, `DATETIME` o enteros. **No uses `ENUM` para columnas de particionamiento; reemplázalas siempre por `VARCHAR`.**
 
 * **Fase 13 — Fragmentación Horizontal**: Crea `bdd-nodo04` (Shard A: Norte/Este) y `bdd-nodo05` (Shard B: Sur/Oeste) como clones enlazados. Distribuye `clientes`, `pedidos` y `detalle_pedidos` por región usando `mysqldump --where`. Verifica completitud, disjunción y reconstrucción vía `UNION ALL`.
 
