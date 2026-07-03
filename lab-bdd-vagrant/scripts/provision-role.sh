@@ -87,13 +87,15 @@ CNF
         cat > /etc/mysql/mariadb.conf.d/60-replication.cnf << CNF
 [mariadb]
 server_id = $NODE_ID
-log_bin = /var/log/mysql/mariadb-bin
+# Binlog desactivado en shards (Fase 13): no replican datos,
+# solo almacenan fragmentos horizontales/verticales.
+# log_bin = /var/log/mysql/mariadb-bin
 binlog_format = ROW
 expire_logs_days = 7
 max_binlog_size = 100M
 binlog_annotate_row_events = ON
 gtid_domain_id = 1
-log_slave_updates = ON
+# log_slave_updates = ON
 skip_name_resolve = ON
 CNF
         ;;
@@ -225,6 +227,12 @@ else
                     04-spider-setup.sql)
                         if [ "$ROLE" != "spider" ]; then
                             echo "     (saltado $BASENAME, solo spider)"
+                            SKIP=1
+                        fi
+                        ;;
+                    04-fix-shard-schema.sql)
+                        if [ "$ROLE" != "shard" ]; then
+                            echo "     (saltado $BASENAME, solo shards)"
                             SKIP=1
                         fi
                         ;;
