@@ -106,7 +106,7 @@ CNF
 [mariadb]
 server_id = $NODE_ID
 # Coordinador Spider: no replica ni almacena datos de negocio
-log_bin = OFF
+skip_log_bin
 skip_slave_start = ON
 read_only = OFF
 bind-address = 0.0.0.0

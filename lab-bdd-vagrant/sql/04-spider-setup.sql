@@ -23,6 +23,10 @@ INSTALL SONAME 'ha_spider';
 -- ============================================================================
 SET foreign_key_checks = 0;
 
+-- Limpiar servidores antiguos (nombres de implementaciones previas)
+DROP SERVER IF EXISTS shard_a;
+DROP SERVER IF EXISTS shard_b;
+
 DROP SERVER IF EXISTS srv_nodo04;
 CREATE SERVER srv_nodo04
 FOREIGN DATA WRAPPER mysql
@@ -52,6 +56,10 @@ CREATE DATABASE IF NOT EXISTS lab_bdd
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 USE lab_bdd;
+
+-- Limpiar tablas con nombres antiguos (de implementaciones previas)
+DROP TABLE IF EXISTS productos_basico, productos_detalle;
+DROP TABLE IF EXISTS detalle_pedidos;
 
 -- ============================================================================
 -- 4. TABLAS SPIDER — FRAGMENTACIÓN HORIZONTAL (PARTITION BY LIST COLUMNS)
