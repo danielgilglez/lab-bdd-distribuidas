@@ -7500,6 +7500,8975 @@ de que el clúster sigue funcionando bien después de esta fase.
 
 ---
 
+# Fase 12 — Particionamiento de Tablas en MariaDB
+
+Fase 12 — Particionamiento de Tablas en MariaDB
+Materia BDD
+Continuación directa de la Fase 11. Los tres nodos activos tienen MariaDB 10.11
+instalado y funcionando: bdd-nodo01 es el maestro de replicación física,
+bdd-nodo02 su esclavo ( read_only = ON ) y bdd-nodo03 es el nodo de
+replicación lógica multi-maestro. Los snapshots fase11-completa están tomados
+en los tres nodos. En esta fase toda la actividad DDL ocurre en bdd-nodo01
+(los cambios se propagarán automáticamente a bdd-nodo02 vía replicación física):
+se creará el esquema lab_particiones donde se demostrarán y validarán los cuatro
+tipos de particionamiento nativo de MariaDB (RANGE, LIST, HASH y KEY), que son
+la base conceptual y técnica directa de la fragmentación distribuida de las
+Fases 13 a 15.
+A. Objetivos de aprendizaje
+Al finalizar esta fase, el estudiante será capaz de:
+ Distinguir entre particionamiento nativo (datos en un único servidor
+divididos en segmentos internos) y fragmentación distribuida (datos en
+servidores físicamente separados) comprendiendo que el primero es la base
+conceptual del segundo
+ Diseñar y crear tablas con los cuatro tipos de particionamiento de MariaDB:
+RANGE LIST HASH y KEY incluyendo sus variantes COLUMNS 
+ Explicar y demostrar la poda de particiones (partition pruning) cómo el
+optimizador de MariaDB elimina particiones irrelevantes del plan de ejecución
+cuando la cláusula WHERE contiene un predicado sobre el atributo de
+particionamiento
+ Leer e interpretar INFORMATION_SCHEMA.PARTITIONS para auditar la distribución
+de filas entre particiones y detectar desbalanceos
+ Ejecutar las operaciones de mantenimiento de particiones ADD PARTITION 
+DROP PARTITION  REORGANIZE PARTITION  TRUNCATE PARTITION y
+ANALYZE PARTITION 
+1
+
+ Identificar y explicar la incompatibilidad entre claves foráneas y
+particionamiento nativo en MariaDB y discutir cómo la fragmentación
+distribuida de las Fases – aborda esa limitación de forma diferente
+ Aplicar la restricción de clave primaria compuesta que impone MariaDB cuando
+el atributo de particionamiento no es la columna de identidad principal
+ Conectar el diseño de particionamiento LIST por  region  de esta fase con el
+plan de fragmentación horizontal del Documento de Diseño Distribuido (Fase )
+evidenciando la continuidad conceptual entre ambos enfoques
+B. Conceptos teóricos necesarios
+1. Particionamiento nativo vs. fragmentación distribuida.
+Ambas técnicas dividen los datos de una tabla en subconjuntos más pequeños, pero
+difieren en su ámbito físico:
+| Característica    | Particionamient | Fragmentación  |
+| ----------------- | --------------- | -------------- |
+|                   | o nativo (Fase  | distribuida    |
+|                   | )             | (Fases –)  |
+| Ubicación de los  | Un único        | Múltiples      |
+| datos             | servidor        | servidores     |
+| Transparencia     | Total para el   | Lograda        |
+|                   | cliente         | mediante el    |
+coordinador
+Spider
+| Claves foráneas | No soportadas  | Gestionadas a  |
+| --------------- | -------------- | -------------- |
+|                 | entre tablas   | nivel de       |
+|                 | particionadas  | aplicación     |
+| Objetivo        | Rendimiento y  | Escalabilidad  |
+| principal       | mantenimiento  | horizontal y   |
+disponibilidad
+| Sintaxis | PARTITION BY |   Tablas tipo  |
+| -------- | ------------ | -------------- |
+|          | en  CREATE   | Spider en el   |
+|          | TABLE        | coordinador    |
+2
+
+El particionamiento nativo es el primer paso para entender la fragmentación: los
+mismos predicados ( region = 'norte' , rango de fechas) que definen particiones
+locales en esta fase definirán fragmentos en nodos separados en las Fases 13 y 14.
+2. Tipos de particionamiento en MariaDB.
+• RANGE divide las filas según rangos de valores de una expresión numérica o
+de fecha Cada partición recibe las filas cuya expresión es menor que el límite
+superior ( VALUES LESS THAN )
+SQL
+PARTITION BY RANGE (YEAR(fecha_pedido)) (
+PARTITION p2024 VALUES LESS THAN (2025),
+PARTITION p2025 VALUES LESS THAN (2026),
+PARTITION p_futuro VALUES LESS THAN MAXVALUE
+)
+• LIST divide las filas según un conjunto de valores discretos y explícitos
+Si un valor insertado no pertenece a ninguna lista la operación falla con
+ERROR 1526 
+SQL
+PARTITION BY LIST COLUMNS (region) (
+PARTITION p_norte VALUES IN ('norte'),
+PARTITION p_sur VALUES IN ('sur')
+)
+• HASH aplica una función de módulo sobre una expresión numérica para distribuir
+filas uniformemente El número de particiones se fija en la definición no existe
+un predicado de negocio explícito
+SQL
+PARTITION BY HASH (id) PARTITIONS 4
+• KEY similar a HASH pero usa el algoritmo de hashing interno de MariaDB con
+soporte para columnas de cualquier tipo (incluidas cadenas de texto) Si no se
+especifica columna usa la clave primaria
+3
+
+SQL
+PARTITION BY KEY (sku) PARTITIONS 4
+3. Variantes COLUMNS.
+Las variantes RANGE COLUMNS y LIST COLUMNS amplían RANGE y LIST para soportar
+columnas de tipo VARCHAR , CHAR , DATE , DATETIME y ENUM , eliminando la
+restricción de usar solo expresiones numéricas enteras. Son las variantes
+obligatorias para la columna region ENUM(...) de este laboratorio: intentar
+usar LIST estándar con un ENUM produce un error de sintaxis.
+4. Poda de particiones (partition pruning).
+Cuando una consulta incluye en su WHERE un predicado sobre el atributo de
+particionamiento, el optimizador identifica cuáles particiones pueden contener filas
+que cumplan ese predicado y descarta las demás antes de leer ningún dato. La poda
+reduce el volumen real de datos que el motor examina.
+EXPLAIN muestra en la columna partitions exactamente qué particiones se
+consultarán. Comparar el valor de rows entre una consulta con y sin filtro
+cuantifica el beneficio de la poda:
+SQL
+-- Solo leerá p_norte (poda activa)
+EXPLAIN SELECT * FROM clientes_list4 WHERE region = 'norte';
+-- Leerá las cuatro particiones (sin poda)
+EXPLAIN SELECT * FROM clientes_list4;
+La poda funciona con RANGE y LIST, pero no con HASH ni KEY: en estos tipos el
+motor desconoce de antemano en qué partición cae un valor de negocio dado
+(solo conoce el módulo o el hash del propio atributo de particionamiento).
+5. Restricción de clave primaria con particionamiento.
+MariaDB exige que el atributo de particionamiento esté incluido en cada índice
+único de la tabla, incluida la clave primaria. Si la tabla tiene un
+AUTO_INCREMENT sobre una columna distinta al atributo de particionamiento, la
+4
+
+solución estándar es una PK compuesta:
+SQL
+PRIMARY KEY (id, region) -- id AUTO_INCREMENT, region es la clave
+de particionamiento
+Consecuencia importante: con una PK compuesta, el AUTO_INCREMENT opera de forma
+por partición en ciertas versiones del motor, lo que significa que dos filas en
+particiones distintas podrían recibir el mismo valor de id . Para el laboratorio,
+donde los datos se insertan con IDs explícitos, esto no representa un problema
+práctico, pero es esencial documentarlo para aplicaciones reales.
+6. Incompatibilidad con claves foráneas.
+MariaDB no permite claves foráneas ( FOREIGN KEY ) en tablas particionadas. Esta
+es la limitación más importante que distingue el particionamiento nativo de la
+fragmentación distribuida:
+• Las tablas de lab_bdd tienen FK entre sí ( pedidos → clientes 
+detalle_pedidos → pedidos y detalle_pedidos → productos ) Ninguna puede
+particionarse directamente sin eliminar primero esas FK
+• En la fragmentación distribuida de las Fases – la integridad referencial
+entre fragmentos en nodos distintos se gestiona a nivel de aplicación o mediante
+scripts de validación periódica El motor Spider no impone FK entre nodos
+Esta fase crea un esquema separado lab_particiones con tablas sin FK para no
+alterar el esquema lab_bdd ya bajo replicación.
+7. Mantenimiento de particiones.
+Una ventaja clave del particionamiento frente a las tablas normales es la
+posibilidad de operar sobre particiones individuales sin afectar a las demás:
+• ADD PARTITION  agrega una partición nueva a una tabla LIST (requiere que el
+dominio del ENUM ya incluya el nuevo valor) o a una tabla RANGE (requiriendo
+REORGANIZE previo si ya existía MAXVALUE )
+5
+
+• DROP PARTITION  elimina la partición y todos sus datos en una sola
+operación de metadatos mucho más rápida que un DELETE masivo equivalente sobre
+InnoDB
+• REORGANIZE PARTITION p1, p2 INTO (...)  fusiona o divide particiones
+existentes redistribuyendo sus filas sin pérdida de datos
+• TRUNCATE PARTITION  vacía los datos de una partición sin eliminar su
+definición Útil para archivar datos históricos
+• ANALYZE PARTITION  actualiza las estadísticas del optimizador para una o más
+particiones Necesario tras inserciones masivas porque InnoDB no actualiza
+TABLE_ROWS en INFORMATION_SCHEMA de forma inmediata
+8. Subparticionamiento (composite partitioning).
+MariaDB permite dividir cada partición en subparticiones usando una segunda
+estrategia: solo son válidas las combinaciones RANGE+HASH, RANGE+KEY, LIST+HASH y
+LIST+KEY. El resultado es una tabla con p × s segmentos físicos de datos
+( p particiones, s subparticiones). Esta fase introduce el concepto con un
+ejemplo demostrativo; en las Fases 13–15 la distribución entre nodos ofrece mayor
+flexibilidad y es la ruta recomendada para escalar el laboratorio.
+C. Procedimiento paso a paso
+Paso 1 — Iniciar las VMs y verificar que la replicación física sigue activa.
+Confirmar antes de crear cualquier objeto nuevo: los DDL de lab_particiones se
+propagan a bdd-nodo02 automáticamente.
+Paso 2 — Crear el esquema lab_particiones .
+Esquema de demostración aislado de lab_bdd , sin claves foráneas entre sus tablas.
+Paso 3 — Crear y poblar clientes_list4 : LIST COLUMNS con cuatro particiones.
+Una partición por valor de region . Caso más directo de particionamiento que mapea
+exactamente a los fragmentos diseñados en la Fase 9.
+Paso 4 — Crear y poblar clientes_list2 y pedidos_list2 : LIST COLUMNS con dos
+particiones.
+Agrupa dos regiones por partición ( norte+este / sur+oeste ), replicando los
+predicados exactos de frag_A y frag_B del Documento de Diseño Distribuido. Son el
+puente conceptual directo con la Fase 13.
+6
+
+Paso 5 — Crear y poblar pedidos_range : RANGE por año.
+Demuestra particionamiento temporal, patrón habitual en sistemas con datos históricos
+que deben archivarse o eliminarse periódicamente.
+Paso 6 — Crear accesos_hash y log_eventos_key : HASH y KEY.
+Demuestran distribución uniforme sin predicado de negocio explícito, con columna
+numérica (HASH) y columna de texto (KEY).
+Paso 7 — Verificar la poda de particiones con EXPLAIN.
+Ejecutar consultas con y sin predicado sobre el atributo de particionamiento;
+comparar las columnas partitions y rows en el plan de ejecución para los cuatro
+tipos.
+Paso 8 — Auditar la distribución de filas con INFORMATION_SCHEMA.PARTITIONS.
+Consultar las métricas de cada partición: filas estimadas, tamaño de datos e índices.
+Paso 9 — Ejecutar operaciones de mantenimiento de particiones.
+Practicar ADD PARTITION , REORGANIZE PARTITION , TRUNCATE PARTITION ,
+ANALYZE PARTITION y DROP PARTITION sobre las tablas de demostración.
+Paso 10 — Demostrar subparticionamiento (LIST + HASH).
+Crear clientes_subpart con cuatro particiones y dos subparticiones cada una.
+Paso 11 — Demostrar la restricción con claves foráneas.
+Intentar agregar FK a una tabla particionada y particionar una tabla que ya tiene FK,
+observando y documentando el error en ambos casos.
+Paso 12 — Apagar las VMs y tomar el snapshot fase12-completa .
+D. Comandos completos
+Los comandos marcados (VM) se ejecutan en una sesión SSH en la VM indicada.
+Los marcados (host) se ejecutan en PowerShell en Windows.
+Los bloques iniciados con sudo mariadb se ejecutan dentro del motor MariaDB.
+7
+
+D.1 Iniciar las VMs y verificar la replicación (host + VM)
+PowerShell
+# Iniciar los tres nodos activos
+VBoxManage startvm "bdd-nodo01" --type headless
+VBoxManage startvm "bdd-nodo02" --type headless
+VBoxManage startvm "bdd-nodo03" --type headless
+Esperar 25–30 segundos y conectarse a bdd-nodo01 :
+PowerShell
+ssh bddadmin@192.168.56.101
+Verificar que la replicación física sigue activa (VM — bdd-nodo01):
+Bash
+sudo mariadb -e "SHOW MASTER STATUS\G"
+La salida debe mostrar un File de binlog activo y una Position mayor a cero.
+Verificar en bdd-nodo02 que el esclavo sigue funcionando (nueva terminal PowerShell):
+PowerShell
+ssh bddadmin@192.168.56.102
+Bash
+# En bdd-nodo02
+sudo mariadb -e "SHOW REPLICA STATUS\G" 2>/dev/null || \
+sudo mariadb -e "SHOW SLAVE STATUS\G"
+Buscar Replica_IO_Running: Yes y Replica_SQL_Running: Yes . Si alguna
+muestra No , resolver el problema de replicación antes de continuar con esta fase.
+8
+
+D.2 Crear el esquema lab_particiones (VM — bdd-nodo01)
+Bash
+sudo mariadb << 'EOF'
+-- Esquema dedicado a la demostración de particionamiento nativo.
+-- Aislado de lab_bdd para no tocar objetos ya replicados con FK.
+CREATE DATABASE IF NOT EXISTS lab_particiones
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_unicode_ci
+COMMENT 'Demostración de particionamiento nativo MariaDB — Fase 12';
+-- Confirmar creación
+SELECT SCHEMA_NAME,
+DEFAULT_CHARACTER_SET_NAME AS charset,
+DEFAULT_COLLATION_NAME AS collation
+FROM information_schema.SCHEMATA
+WHERE SCHEMA_NAME = 'lab_particiones';
+EOF
+Confirmar que el nuevo esquema ya llegó a bdd-nodo02 (la replicación lo propagó):
+Bash
+# En bdd-nodo02 — esperar ~5 segundos tras crear el esquema en nodo01
+sudo mariadb -e "SHOW DATABASES LIKE 'lab_particiones';"
+Si aparece lab_particiones , la replicación funciona correctamente y se puede
+continuar.
+9
+
+D.3 LIST COLUMNS — cuatro particiones (una por región) (VM —
+bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- TIPO: LIST COLUMNS — 4 particiones, una por valor de ENUM
+-- Mapeo con Fase 9: cada partición corresponde exactamente
+-- a un valor del dominio del atributo de fragmentación.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clientes_list4 (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+email VARCHAR(150),
+telefono VARCHAR(20),
+region VARCHAR(10) NOT NULL,
+ciudad VARCHAR(100),
+fecha_alta DATETIME DEFAULT CURRENT_TIMESTAMP,
+-- La PK DEBE incluir la columna de particionamiento.
+-- Con PRIMARY KEY(id) solo, MariaDB devuelve ERROR 1503.
+PRIMARY KEY (id, region)
+) ENGINE=InnoDB
+COMMENT='Demo LIST COLUMNS — 4 particiones, una por región'
+PARTITION BY LIST COLUMNS (region) (
+PARTITION p_norte VALUES IN ('norte'),
+PARTITION p_sur VALUES IN ('sur'),
+PARTITION p_este VALUES IN ('este'),
+PARTITION p_oeste VALUES IN ('oeste')
+);
+-- Poblar desde lab_bdd (cross-database SELECT, requiere conexión como root)
+INSERT INTO clientes_list4
+(id, nombre, apellido, email, telefono, region, ciudad, fecha_alta)
+SELECT id, nombre, apellido, email, telefono, region, ciudad, fecha_alta
+FROM lab_bdd.clientes;
+-- Las estadísticas de InnoDB no se actualizan al instante:
+-- ANALYZE TABLE fuerza el recálculo de TABLE_ROWS en INFORMATION_SCHEMA
+ANALYZE TABLE clientes_list4;
+-- Verificar la distribución de filas por partición
+SELECT PARTITION_NAME AS particion,
+PARTITION_DESCRIPTION AS region_cubierta,
+TABLE_ROWS AS filas
+FROM information_schema.PARTITIONS
+10
+
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'clientes_list4'
+ORDER BY PARTITION_ORDINAL_POSITION;
+-- Resultado esperado: 4 filas, 5 clientes en cada partición
+EOF
+11
+
+D.4 LIST COLUMNS — dos particiones (predicados del DDD, Fase 9) (VM —
+bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- TIPO: LIST COLUMNS — 2 particiones
+-- Predicados: IDÉNTICOS a frag_A y frag_B del DDD (Fase 9).
+-- Esta tabla es el puente conceptual directo con la Fase 13:
+-- lo que aquí son particiones locales, allí serán nodos físicos.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clientes_list2 (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+email VARCHAR(150),
+telefono VARCHAR(20),
+region VARCHAR(10) NOT NULL,
+ciudad VARCHAR(100),
+fecha_alta DATETIME DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (id, region)
+) ENGINE=InnoDB
+COMMENT='Demo LIST COLUMNS — 2 particiones (espeja frag_A y frag_B del DDD
+Fase 9)'
+PARTITION BY LIST COLUMNS (region) (
+PARTITION frag_A VALUES IN ('norte', 'este'),
+PARTITION frag_B VALUES IN ('sur', 'oeste')
+);
+INSERT INTO clientes_list2
+(id, nombre, apellido, email, telefono, region, ciudad, fecha_alta)
+SELECT id, nombre, apellido, email, telefono, region, ciudad, fecha_alta
+FROM lab_bdd.clientes;
+-- -------------------------------------------------------
+-- Tabla de pedidos con el mismo esquema de 2 particiones
+-- -------------------------------------------------------
+-- IMPORTANTE: NO se define FOREIGN KEY (cliente_id → clientes_list2.id)
+-- porque el motor rechaza FK en tablas particionadas. Ver sección D.11.
+CREATE TABLE IF NOT EXISTS pedidos_list2 (
+id INT NOT NULL AUTO_INCREMENT,
+cliente_id INT NOT NULL,
+region VARCHAR(10) NOT NULL,
+fecha_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+estado ENUM('pendiente','procesado','enviado',
+12
+
+'entregado','cancelado') DEFAULT 'pendiente',
+total DECIMAL(10,2),
+PRIMARY KEY (id, region)
+) ENGINE=InnoDB
+COMMENT='Demo pedidos LIST COLUMNS — 2 particiones (espeja frag_A y frag_B
+del DDD)'
+PARTITION BY LIST COLUMNS (region) (
+PARTITION frag_A VALUES IN ('norte', 'este'),
+PARTITION frag_B VALUES IN ('sur', 'oeste')
+);
+INSERT INTO pedidos_list2
+(id, cliente_id, region, fecha_pedido, estado, total)
+SELECT id, cliente_id, region, fecha_pedido, estado, total
+FROM lab_bdd.pedidos;
+ANALYZE TABLE clientes_list2;
+ANALYZE TABLE pedidos_list2;
+-- Verificar distribución en ambas tablas
+SELECT 'clientes_list2' AS tabla, PARTITION_NAME AS particion,
+PARTITION_DESCRIPTION AS regiones, TABLE_ROWS AS filas
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'clientes_list2'
+UNION ALL
+SELECT 'pedidos_list2', PARTITION_NAME,
+PARTITION_DESCRIPTION, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'pedidos_list2'
+ORDER BY tabla, particion;
+-- Confirmar la integridad con conteos exactos
+SELECT 'lab_bdd.clientes (referencia)' AS origen, COUNT(*) AS total
+FROM lab_bdd.clientes
+UNION ALL
+SELECT 'clientes_list4', COUNT(*) FROM clientes_list4
+UNION ALL
+SELECT 'clientes_list2', COUNT(*) FROM clientes_list2
+UNION ALL
+SELECT 'lab_bdd.pedidos (referencia)', COUNT(*) FROM lab_bdd.pedidos
+UNION ALL
+SELECT 'pedidos_list2', COUNT(*) FROM pedidos_list2;
+EOF
+13
+
+D.5 RANGE — particionamiento por año de pedido (VM — bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- TIPO: RANGE — partición por año
+-- Expresión: YEAR(fecha_pedido)
+-- Uso típico: datos con dimensión temporal clara; permite
+-- archivar o eliminar datos históricos por partición completa,
+-- sin DELETE masivo ni impacto en particiones activas.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS pedidos_range (
+id INT NOT NULL AUTO_INCREMENT,
+cliente_id INT NOT NULL,
+region ENUM('norte','sur','este','oeste') NOT NULL,
+fecha_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+estado ENUM('pendiente','procesado','enviado',
+'entregado','cancelado') DEFAULT 'pendiente',
+total DECIMAL(10,2),
+-- La expresión de particionamiento es YEAR(fecha_pedido).
+-- Como YEAR() no puede incluirse literalmente en la PK,
+-- se incluye la columna base fecha_pedido.
+PRIMARY KEY (id, fecha_pedido)
+) ENGINE=InnoDB
+COMMENT='Demo RANGE — partición por año de pedido'
+PARTITION BY RANGE (YEAR(fecha_pedido)) (
+PARTITION p_anterior VALUES LESS THAN (2024),
+PARTITION p_2024 VALUES LESS THAN (2025),
+PARTITION p_2025 VALUES LESS THAN (2026),
+PARTITION p_2026 VALUES LESS THAN (2027),
+PARTITION p_futuro VALUES LESS THAN MAXVALUE
+);
+-- Insertar los pedidos reales de lab_bdd
+INSERT INTO pedidos_range
+(id, cliente_id, region, fecha_pedido, estado, total)
+SELECT id, cliente_id, region, fecha_pedido, estado, total
+FROM lab_bdd.pedidos;
+-- Añadir pedidos simulados de años anteriores para poblar más particiones
+INSERT INTO pedidos_range (cliente_id, region, fecha_pedido, estado,
+total) VALUES
+( 1, 'norte', '2023-03-15 10:00:00', 'entregado', 3500.00),
+( 2, 'norte', '2023-06-20 14:30:00', 'entregado', 1200.00),
+( 6, 'sur', '2023-09-10 09:15:00', 'entregado', 4200.00),
+(11, 'este', '2024-01-05 11:00:00', 'entregado', 950.00),
+14
+
+(16, 'oeste', '2024-07-22 16:45:00', 'entregado', 2800.00);
+ANALYZE TABLE pedidos_range;
+SELECT PARTITION_NAME AS particion,
+PARTITION_DESCRIPTION AS limite_superior,
+TABLE_ROWS AS filas
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'pedidos_range'
+ORDER BY PARTITION_ORDINAL_POSITION;
+-- Consulta por un año específico: la poda debería activarse
+SELECT COUNT(*) AS pedidos_2025,
+ROUND(SUM(total), 2) AS facturacion_2025
+FROM pedidos_range
+WHERE YEAR(fecha_pedido) = 2025;
+EOF
+15
+
+D.6 HASH y KEY — distribución uniforme (VM — bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- TIPO: HASH — distribución por módulo sobre id (numérico)
+-- Uso: distribución uniforme cuando no existe predicado
+-- de negocio natural para segmentar.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS accesos_hash (
+id BIGINT NOT NULL AUTO_INCREMENT,
+usuario_id INT NOT NULL,
+recurso VARCHAR(200) NOT NULL,
+accion ENUM('SELECT','INSERT','UPDATE','DELETE') NOT NULL,
+ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+ip_origen VARCHAR(45),
+-- Con HASH(id) y PK(id) la restricción se satisface porque
+-- la expresión de particionamiento depende directamente de la PK.
+PRIMARY KEY (id)
+) ENGINE=InnoDB
+COMMENT='Log de accesos — demostración HASH por id'
+PARTITION BY HASH (id) PARTITIONS 4;
+-- Insertar 100 registros de prueba (5 accesos por cada cliente ×
+20 clientes)
+INSERT INTO accesos_hash (usuario_id, recurso, accion, ip_origen)
+SELECT
+c.id AS usuario_id,
+CONCAT('/api/recurso/', n.n, '/', c.id) AS recurso,
+ELT(((c.id + n.n - 1) % 4) + 1,
+'SELECT','INSERT','UPDATE','DELETE') AS accion,
+CONCAT('192.168.56.', 100 + (c.id % 7)) AS ip_origen
+FROM lab_bdd.clientes c
+CROSS JOIN (
+SELECT 1 AS n UNION SELECT 2 UNION SELECT 3
+UNION SELECT 4 UNION SELECT 5
+) n;
+ANALYZE TABLE accesos_hash;
+SELECT PARTITION_NAME AS particion,
+TABLE_ROWS AS filas_estimadas
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'accesos_hash'
+ORDER BY PARTITION_NAME;
+-- ============================================================
+16
+
+-- TIPO: KEY — hashing interno de MariaDB sobre columna de texto
+-- Uso: distribución uniforme sobre columnas no numéricas.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS log_eventos_key (
+id BIGINT NOT NULL AUTO_INCREMENT,
+nivel ENUM('DEBUG','INFO','WARN','ERROR','FATAL') NOT NULL,
+componente VARCHAR(50) NOT NULL,
+mensaje TEXT,
+ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+servidor VARCHAR(30),
+-- PK compuesta porque 'componente' es el atributo de particionamiento
+PRIMARY KEY (id, componente)
+) ENGINE=InnoDB
+COMMENT='Log de eventos — demostración KEY sobre columna de texto'
+PARTITION BY KEY (componente) PARTITIONS 4;
+INSERT INTO log_eventos_key (nivel, componente, mensaje, servidor) VALUES
+('INFO', 'replicacion', 'Binlog position actualizada',
+'bdd-nodo01'),
+('INFO', 'replicacion', 'Replica IO thread activo',
+'bdd-nodo02'),
+('WARN', 'conexiones', 'Pool de conexiones al 80%',
+'bdd-nodo01'),
+('ERROR', 'particion', 'No se encontró partición para valor
+recibido','bdd-nodo04'),
+('INFO', 'spider', 'Consulta ejecutada en 2 nodos remotos',
+'bdd-nodo06'),
+('DEBUG', 'consultas', 'Plan de ejecución seleccionado',
+'bdd-nodo01'),
+('INFO', 'respaldos', 'mysqldump completado exitosamente',
+'bdd-nodo01'),
+('FATAL', 'replicacion', 'Replica SQL thread detenido por error',
+'bdd-nodo02'),
+('INFO', 'conexiones', 'Nueva conexión desde 192.168.56.107',
+'bdd-nodo06'),
+('WARN', 'consultas', 'Slow query detectada: 3.2 segundos',
+'bdd-nodo01'),
+('INFO', 'particion', 'ANALYZE PARTITION completado',
+'bdd-nodo04'),
+('ERROR', 'spider', 'Timeout en nodo remoto 192.168.56.105',
+'bdd-nodo06');
+ANALYZE TABLE log_eventos_key;
+SELECT PARTITION_NAME AS particion,
+TABLE_ROWS AS filas_estimadas
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+17
+
+AND TABLE_NAME = 'log_eventos_key'
+ORDER BY PARTITION_NAME;
+EOF
+18
+
+D.7 Verificación de poda de particiones con EXPLAIN (VM — bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- EXPERIMENTO A: LIST — poda activa con predicado de igualdad
+-- ============================================================
+-- Con predicado exacto → EXPLAIN debe mostrar solo 'p_norte'
+EXPLAIN SELECT id, nombre, ciudad
+FROM clientes_list4
+WHERE region = 'norte';
+-- Sin predicado → EXPLAIN muestra las cuatro particiones
+EXPLAIN SELECT id, nombre, ciudad
+FROM clientes_list4;
+-- Con IN sobre dos valores → solo las particiones de esos valores
+EXPLAIN SELECT id, nombre, ciudad
+FROM clientes_list4
+WHERE region IN ('norte', 'este');
+-- ============================================================
+-- EXPERIMENTO B: RANGE — poda temporal
+-- ============================================================
+-- Solo la partición del año filtrado debe aparecer
+EXPLAIN SELECT COUNT(*), SUM(total)
+FROM pedidos_range
+WHERE YEAR(fecha_pedido) = 2025;
+-- Rango de dos años → dos particiones
+EXPLAIN SELECT COUNT(*), SUM(total)
+FROM pedidos_range
+WHERE fecha_pedido BETWEEN '2024-01-01' AND '2025-12-31';
+-- Sin filtro temporal → todas las particiones, incluida p_futuro
+EXPLAIN SELECT COUNT(*), SUM(total)
+FROM pedidos_range;
+-- ============================================================
+-- EXPERIMENTO C: HASH — la poda NO funciona con predicados de negocio
+-- El motor no puede deducir el módulo a partir de usuario_id.
+-- ============================================================
+-- Todas las particiones se consultan aunque filtremos por usuario_id
+EXPLAIN SELECT COUNT(*)
+FROM accesos_hash
+WHERE usuario_id = 1;
+-- Solo con el atributo de hash exacto (id) puede podar
+EXPLAIN SELECT * FROM accesos_hash WHERE id = 42;
+-- ============================================================
+-- RESUMEN: conteo exacto por partición para confirmar distribución
+19
+
+-- ============================================================
+SELECT 'p_norte (list4)' AS particion, COUNT(*) AS filas
+FROM clientes_list4 WHERE region = 'norte' UNION ALL
+SELECT 'p_sur (list4)', COUNT(*) FROM clientes_list4 WHERE region = 'sur'
+UNION ALL
+SELECT 'p_este (list4)', COUNT(*) FROM clientes_list4 WHERE region = 'este'
+UNION ALL
+SELECT 'p_oeste (list4)', COUNT(*) FROM clientes_list4 WHERE region =
+'oeste' UNION ALL
+SELECT 'frag_A (list2)', COUNT(*) FROM clientes_list2 WHERE region IN
+('norte','este') UNION ALL
+SELECT 'frag_B (list2)', COUNT(*) FROM clientes_list2 WHERE region
+IN ('sur','oeste');
+EOF
+Interpretación de EXPLAIN: la columna partitions lista exactamente las
+particiones que el motor leerá. La columna rows indica las filas estimadas a
+examinar. Compara el valor de rows entre la consulta con filtro ( = 'norte' )
+y sin filtro (tabla completa) para cuantificar el beneficio de la poda.
+20
+
+D.8 Auditoría con INFORMATION_SCHEMA.PARTITIONS (VM —
+bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- Vista completa de todas las particiones del esquema
+SELECT
+TABLE_NAME AS tabla,
+PARTITION_NAME AS particion,
+PARTITION_METHOD AS tipo,
+PARTITION_EXPRESSION AS expresion,
+PARTITION_DESCRIPTION AS definicion,
+TABLE_ROWS AS filas_est,
+ROUND(DATA_LENGTH / 1024.0, 2) AS datos_KB,
+ROUND(INDEX_LENGTH / 1024.0, 2) AS indices_KB
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION;
+-- Totales por tabla: útil para comparar contra las referencias de lab_bdd
+SELECT
+TABLE_NAME AS tabla,
+COUNT(PARTITION_NAME) AS num_particiones,
+SUM(TABLE_ROWS) AS filas_totales_est,
+ROUND(SUM(DATA_LENGTH + INDEX_LENGTH) / 1024.0, 2) AS total_KB
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+GROUP BY TABLE_NAME
+ORDER BY TABLE_NAME;
+EOF
+21
+
+D.9 Mantenimiento de particiones (VM — bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- OPERACIÓN 1: ADD PARTITION
+-- Escenario: la empresa abre operaciones en 'centro'; se agrega
+-- una quinta partición a clientes_list4.
+-- ============================================================
+-- Paso a: ampliar el ENUM para aceptar el nuevo valor
+ALTER TABLE clientes_list4
+MODIFY COLUMN region
+ENUM('norte','sur','este','oeste','centro') NOT NULL;
+-- Paso b: crear la partición que recibirá ese valor
+ALTER TABLE clientes_list4
+ADD PARTITION (PARTITION p_centro VALUES IN ('centro'));
+-- Confirmar la nueva estructura
+SELECT PARTITION_NAME, PARTITION_DESCRIPTION, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'clientes_list4'
+ORDER BY PARTITION_ORDINAL_POSITION;
+-- Insertar un cliente de prueba en la nueva partición
+INSERT INTO clientes_list4 (id, nombre, apellido, email, region, ciudad)
+VALUES (21, 'Gabriela', 'Núñez', 'gabriela.nunez@lab.test',
+'centro', 'CDMX');
+SELECT region, COUNT(*) AS clientes FROM clientes_list4 GROUP BY region ORDER
+BY region;
+-- ============================================================
+-- OPERACIÓN 2: REORGANIZE PARTITION
+-- Escenario: dividir la partición frag_A de clientes_list2
+-- en dos particiones individuales (norte y este por separado).
+-- ============================================================
+ALTER TABLE clientes_list2
+REORGANIZE PARTITION frag_A INTO (
+PARTITION p_norte VALUES IN ('norte'),
+PARTITION p_este VALUES IN ('este')
+);
+ANALYZE TABLE clientes_list2;
+SELECT PARTITION_NAME, PARTITION_DESCRIPTION, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'clientes_list2'
+ORDER BY PARTITION_ORDINAL_POSITION;
+22
+
+-- El total de clientes_list2 debe seguir siendo 20
+SELECT COUNT(*) AS total_clientes_list2 FROM clientes_list2;
+-- ============================================================
+-- OPERACIÓN 3: TRUNCATE PARTITION
+-- Escenario: los pedidos de 2023 ya están en almacenamiento
+-- histórico externo; se eliminan del sistema activo.
+-- TRUNCATE PARTITION es DDL y es MUCHO más rápido que
+-- DELETE FROM ... WHERE YEAR(fecha) < 2024 en tablas grandes.
+-- ============================================================
+-- Antes: distribución por año
+SELECT YEAR(fecha_pedido) AS anyo, COUNT(*) AS pedidos
+FROM pedidos_range
+GROUP BY anyo ORDER BY anyo;
+-- Vaciar solo la partición p_anterior (año < 2024)
+ALTER TABLE pedidos_range TRUNCATE PARTITION p_anterior;
+ANALYZE TABLE pedidos_range;
+SELECT PARTITION_NAME, PARTITION_DESCRIPTION, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'pedidos_range'
+ORDER BY PARTITION_ORDINAL_POSITION;
+-- ============================================================
+-- OPERACIÓN 4: REORGANIZE PARTITION de MAXVALUE
+-- Escenario: a comienzos de 2027 se necesita una partición
+-- explícita para ese año. No se puede ADD directamente porque
+-- p_futuro ya cubre MAXVALUE; se reorganiza para insertar p_2027.
+-- ============================================================
+ALTER TABLE pedidos_range
+REORGANIZE PARTITION p_futuro INTO (
+PARTITION p_2027 VALUES LESS THAN (2028),
+PARTITION p_futuro VALUES LESS THAN MAXVALUE
+);
+SELECT PARTITION_NAME, PARTITION_DESCRIPTION
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'pedidos_range'
+ORDER BY PARTITION_ORDINAL_POSITION;
+-- ============================================================
+-- OPERACIÓN 5: ANALYZE PARTITION — actualizar estadísticas
+-- ============================================================
+ALTER TABLE clientes_list4 ANALYZE PARTITION ALL;
+ALTER TABLE pedidos_range ANALYZE PARTITION p_2024, p_2025, p_2026;
+-- ============================================================
+-- OPERACIÓN 6: DROP PARTITION
+-- Escenario: la expansión al 'centro' fue cancelada.
+23
+
+-- DROP PARTITION elimina la partición Y TODOS SUS DATOS.
+-- ============================================================
+-- Cuántos registros perderemos
+SELECT COUNT(*) AS filas_a_eliminar FROM clientes_list4 WHERE region
+= 'centro';
+-- Eliminar la partición junto con sus datos
+ALTER TABLE clientes_list4 DROP PARTITION p_centro;
+-- El cliente 21 (CDMX) ya no existe
+SELECT COUNT(*) AS total_list4 FROM clientes_list4; -- debe ser 20
+EOF
+24
+
+D.10 Subparticionamiento — LIST + HASH (VM — bdd-nodo01)
+Bash
+sudo mariadb lab_particiones << 'EOF'
+-- ============================================================
+-- SUBPARTICIONAMIENTO: LIST COLUMNS (región) + HASH (id)
+-- Combina la granularidad de negocio (región) con distribución
+-- interna uniforme (hash). Resultado: 4 × 2 = 8 segmentos.
+-- Combinaciones válidas en MariaDB:
+-- RANGE+HASH | RANGE+KEY | LIST+HASH | LIST+KEY
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clientes_subpart (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+region ENUM('norte','sur','este','oeste') NOT NULL,
+ciudad VARCHAR(100),
+PRIMARY KEY (id, region)
+) ENGINE=InnoDB
+COMMENT='Demo subparticionamiento LIST COLUMNS + HASH — 4×2 segmentos'
+PARTITION BY LIST COLUMNS (region)
+SUBPARTITION BY HASH (id) SUBPARTITIONS 2
+(
+PARTITION p_norte VALUES IN ('norte'),
+PARTITION p_sur VALUES IN ('sur'),
+PARTITION p_este VALUES IN ('este'),
+PARTITION p_oeste VALUES IN ('oeste')
+);
+INSERT INTO clientes_subpart (id, nombre, apellido, region, ciudad)
+SELECT id, nombre, apellido, region, ciudad
+FROM lab_bdd.clientes;
+ANALYZE TABLE clientes_subpart;
+-- Verificar la estructura completa: 8 segmentos de datos
+SELECT PARTITION_NAME,
+SUBPARTITION_NAME,
+PARTITION_DESCRIPTION AS region,
+TABLE_ROWS AS filas_est
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'lab_particiones'
+AND TABLE_NAME = 'clientes_subpart'
+ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+EOF
+25
+
+Nota pedagógica: el subparticionamiento añade complejidad de administración
+sin ventajas significativas para los volúmenes de este laboratorio. Se introduce
+como concepto reconocible en documentación y entornos de producción con tablas
+de miles de millones de filas. En las Fases 13–15 la distribución entre nodos
+ofrece mayor flexibilidad para los objetivos del laboratorio.
+D.11 Demostración de la incompatibilidad con claves foráneas (VM —
+bdd-nodo01)
+Los dos comandos ALTER TABLE de este bloque fallarán intencionalmente.
+Los errores son el resultado esperado y forman parte del aprendizaje. Si la
+sesión se interrumpe tras el primer error, reconectar con sudo mariadb y
+ejecutar el segundo bloque de forma independiente.
+Bash
+sudo mariadb << 'EOF'
+-- ============================================================
+-- CASO 1: Intentar agregar FK a una tabla ya particionada
+-- Resultado esperado: ERROR 1506 o similar
+-- ============================================================
+ALTER TABLE lab_particiones.pedidos_list2
+ADD CONSTRAINT fk_pedidos_list2_cliente
+FOREIGN KEY (cliente_id)
+REFERENCES lab_particiones.clientes_list2(id);
+-- ============================================================
+-- CASO 2: Intentar particionar una tabla que ya tiene FK
+-- lab_bdd.pedidos tiene FK hacia lab_bdd.clientes
+-- Resultado esperado: ERROR — la tabla no debe modificarse
+-- ============================================================
+ALTER TABLE lab_bdd.pedidos
+PARTITION BY LIST COLUMNS (region) (
+PARTITION frag_A VALUES IN ('norte', 'este'),
+PARTITION frag_B VALUES IN ('sur', 'oeste')
+);
+EOF
+26
+
+Verificar que lab_bdd.pedidos sigue sin particionar (el segundo ALTER debe haber
+fallado sin modificar la tabla):
+Bash
+sudo mariadb -e "SHOW CREATE TABLE lab_bdd.pedidos\G" | grep -i partition
+Si no aparece ninguna línea con PARTITION , la tabla quedó intacta, que es el
+resultado correcto.
+Bash
+# Confirmar también el conteo de filas de lab_bdd.pedidos (debe seguir
+siendo 20)
+sudo mariadb -e "SELECT COUNT(*) AS filas FROM lab_bdd.pedidos;"
+D.12 Apagar las VMs y tomar los snapshots fase12-completa (host)
+Desde cada sesión SSH activa, apagar ordenadamente:
+Bash
+# En bdd-nodo01
+sudo poweroff
+Bash
+# En bdd-nodo02
+sudo poweroff
+Bash
+# En bdd-nodo03
+sudo poweroff
+27
+
+Confirmar desde el host que las tres VMs se detuvieron:
+PowerShell
+VBoxManage list runningvms
+La salida debe estar vacía. Tomar los snapshots:
+PowerShell
+VBoxManage snapshot "bdd-nodo01" take "fase12-completa" `
+--description "lab_particiones creado: clientes_list4, clientes_list2,
+pedidos_list2, pedidos_range, accesos_hash, log_eventos_key, clientes_subpart.
+Poda verificada. Mantenimiento de particiones demostrado. Restriccion
+FK demostrada."
+VBoxManage snapshot "bdd-nodo02" take "fase12-completa" `
+--description "lab_particiones replicado desde bdd-nodo01 via replicacion
+fisica. Contenido identico. Snapshot de hito de fase."
+VBoxManage snapshot "bdd-nodo03" take "fase12-completa" `
+--description "lab_particiones replicado desde bdd-nodo01 via replicacion
+logica. Snapshot de hito de fase."
+Confirmar que los snapshots existen:
+PowerShell
+VBoxManage snapshot "bdd-nodo01" list
+VBoxManage snapshot "bdd-nodo02" list
+VBoxManage snapshot "bdd-nodo03" list
+bdd-nodo01 y bdd-nodo02 deben mostrar fase05-completa hasta fase12-completa .
+bdd-nodo03 debe mostrar fase11-completa y fase12-completa (se creó en la
+Fase 11).
+E. Verificación de funcionamiento
+Esta fase se considera completa cuando se cumplen todos los puntos siguientes
+en bdd-nodo01 :
+28
+
+|               |     |  incluye        |     |                                     |  en la lista |     |
+| --------------- | --- | --------------- | --- | ----------------------------------- | ------------- | --- |
+| SHOW DATABASES; |     | lab_particiones |     |                                     |               |     |
+|               |     |                 |     |  devuelve exactamente siete tablas |               |     |
+SHOW TABLES IN lab_particiones;
+accesos_hash   clientes_list2   clientes_list4   clientes_subpart 
+|                               |     |              |     |               |     |                |
+| ----------------------------- | --- | ------------- | --- | -------------- | --- | --------------- |
+| log_eventos_key               |     | pedidos_list2 |     | pedidos_range  |     |                 |
+|                             |     |               |     |  para          |     |  muestra cuatro |
+| INFORMATION_SCHEMA.PARTITIONS |     |               |     | clientes_list4 |     |                 |
+particiones ( p_norte   p_sur   p_este   p_oeste ) con  filas cada una
+| (confirmado con  |     |     |  previo) |     |     |     |
+| ---------------- | --- | --- | --------- | --- | --- | --- |
+ANALYZE TABLE
+|                             |     |     |     |  para          |     |  muestra tres particiones |
+| ----------------------------- | --- | --- | --- | -------------- | --- | ------------------------- |
+| INFORMATION_SCHEMA.PARTITIONS |     |     |     | clientes_list2 |     |                           |
+tras el  REORGANIZE PARTITION   p_norte  ( filas)  p_este  ( filas) y
+ ( filas) Total  filas
+frag_B
+|                             |                       |     |                    |  para         |     |  muestra la partición |
+| ----------------------------- | --------------------- | --- | ------------------ | ------------- | --- | --------------------- |
+| INFORMATION_SCHEMA.PARTITIONS |                       |     |                    | pedidos_range |     |                       |
+| p_anterior                    |  con  filas tras el  |     | TRUNCATE PARTITION |               |     |                      |
+ EXPLAIN SELECT * FROM clientes_list4 WHERE region = 'norte'  muestra
+ — poda activa solo una partición leída
+partitions: p_norte
+|   |     |     |     |     |  (sin filtro) muestra las cuatro |     |
+| --- | --- | --- | --- | --- | -------------------------------- | --- |
+EXPLAIN SELECT * FROM clientes_list4
+particiones — sin poda comportamiento esperado
+ EXPLAIN SELECT ... FROM pedidos_range WHERE YEAR(fecha_pedido) = 2025  muestra
+ — poda temporal activa
+partitions: p_2025
+  muestra las
+EXPLAIN SELECT ... FROM accesos_hash WHERE usuario_id = 1
+cuatro particiones — confirma que HASH no realiza poda con predicados de
+negocio distintos al atributo de hash
+ clientes_subpart  muestra  filas en  INFORMATION_SCHEMA.PARTITIONS  (
+particiones ×  subparticiones) con  SUBPARTITION_NAME  distinto de NULL
+ El intento de agregar FK a  pedidos_list2  produce un error ( ERROR 1506  o
+similar) y la tabla no es modificada
+ El intento de particionar  lab_bdd.pedidos  produce un error y la tabla
+original permanece intacta con sus  filas y sus FK definidas (verificado con
+| SHOW CREATE TABLE lab_bdd.pedidos |     |     |     | )  |     |     |
+| --------------------------------- | --- | --- | --- | --- | --- | --- |
+ lab_bdd.clientes  y  lab_bdd.pedidos  en  bdd-nodo01  siguen sin particionamiento
+y con sus datos originales íntegros
+|  El esquema  |     |     |  con sus siete tablas existe también en |     |     |     |
+| --------------- | --- | --- | --------------------------------------- | --- | --- | --- |
+lab_particiones
+| bdd-nodo02         |  (propagado vía replicación física) |                 |                             |     |     |     |
+| ------------------ | ------------------------------------ | --------------- | --------------------------- | --- | --- | --- |
+|  Los snapshots  |                                      | fase12-completa |  existen en los tres nodos |     |     |     |
+29
+
+F. Problemas comunes y soluciones
+| Problema          | Causa probable  | Solución         |      |
+| ----------------- | --------------- | ---------------- | ---- |
+| CREATE TABLE      |   La clave      | Cambiar la PK a  |      |
+| falla con  ERROR  | primaria no     | compuesta       |      |
+| 1503: A           | incluye la      | PRIMARY KEY      |      |
+| PRIMARY KEY       | columna de      | (id, region)     |     |
+| must include      | particionamient | Con  PARTITION   |      |
+|                   | o               | BY HASH(id)      |  la  |
+all columns in
+PK puede ser
+the table's
+solo  id  porque
+partitioning
+la expresión
+function
+depende
+directamente de
+ella
+| ERROR 1526:    | La tabla destino  | Verificar con  |     |
+| -------------- | ----------------- | -------------- | --- |
+| Table has no   | no tiene una      | SELECT         |     |
+| partition for  | partición que     | DISTINCT       |     |
+|                | cubra ese valor   | region FROM    |     |
+value from
+|     |  al  del dominio | lab_bdd.client |     |
+| --- | ---------------- | -------------- | --- |
+column_list
+| insertar |     | es  que todos  |     |
+| -------- | --- | -------------- | --- |
+los valores del
+origen tienen
+partición
+correspondiente
+en el destino
+usar  ADD
+|     |     | PARTITION |  si  |
+| --- | --- | --------- | ---- |
+falta alguno
+| EXPLAIN  no  | La consulta no   | En MariaDB x  |     |
+| ------------ | ---------------- | ---------------- | --- |
+| muestra la   | apunta a una     | EXPLAIN          |     |
+| columna      | tabla            | incluye          |     |
+| partitions   | particionada o  | automáticament   |     |
+|              | se está usando   | e  partitions    |    |
+|              | un cliente que   | usar  EXPLAIN    |     |
+no muestra
+PARTITIONS
+todas las
+|     |     | SELECT ... |     |
+| --- | --- | ---------- | --- |
+columnas
+como sintaxis
+alternativa
+compatible
+|     |  en  InnoDB no  | Ejecutar  |     |
+| --- | --------------- | --------- | --- |
+TABLE_ROWS
+|     | actualiza las  | ANALYZE TABLE  |     |
+| --- | -------------- | -------------- | --- |
+INFORMATION_SC
+|     | estadísticas de  | nombre_tabla; |     |
+| --- | ---------------- | ------------- | --- |
+HEMA.PARTITION
+30
+
+| S  muestra  o    | forma inmediata | y volver a     |
+| ----------------- | --------------- | -------------- |
+| valores           |                 | consultar      |
+| incorrectos tras  |                 | INFORMATION_SC |
+| insertar datos    |                 | HEMA.PARTITION |
+S
+| El intento de   | Las versiones            | Ambos códigos      |
+| --------------- | ------------------------ | ------------------ |
+| agregar FK a    | de MariaDB               | son válidos lo    |
+| una tabla       | difieren en el           | importante es      |
+| particionada    | código exacto            | que el  ALTER      |
+| devuelve        | ERROR  de error para la  | TABLE  falla y la  |
+| 1217  en lugar  | combinación FK           | tabla no se        |
+| de  1506        | +                        | modifica           |
+particionamient
+o
+| ALTER TABLE      | MariaDB            | Es                 |
+| ---------------- | ------------------ | ------------------ |
+| ... REORGANIZE   | reconstruye        | comportamiento     |
+| PARTITION        |   físicamente las  | correcto para el  |
+| tarda más de lo  | particiones        | laboratorio con    |
+| esperado         | afectadas          |  filas no tarda  |
+|                  | (lectura +         | más de –         |
+|                  | escritura          | segundos En       |
+|                  | completa +         | producción con     |
+|                  | reindexado)        | millones de filas  |
+se haría en una
+ventana de
+mantenimiento
+| ADD PARTITION  | El ENUM de la         | Ejecutar primero  |
+| -------------- | --------------------- | ----------------- |
+|                |  falla  tabla aún no  | ALTER TABLE       |
+p_centro
+| con  | incluye el valor  | clientes_list4  |
+| ---- | ----------------- | --------------- |
+Partition
+'centro' MODIFY COLUMN
+column values
+| of incorrect  |     | region         |
+| ------------- | --- | -------------- |
+| type          |     | ENUM('norte',' |
+sur','este','o
+este','centro'
+) NOT NULL;  y
+luego el  ADD
+PARTITION
+| REORGANIZE  | Ya existe una     | Elegir un        |
+| ----------- | ----------------- | ---------------- |
+|             | partición con el  | nombre distinto  |
+PARTITION
+|     | nombre que se  | en la cláusula  |
+| --- | -------------- | --------------- |
+p_futuro INTO
+|  falla con  | quiere crear en  | INTO  el  |
+| ----------- | ---------------- | ---------- |
+(...)
+|     | el INTO | nombre de la  |
+| --- | ------- | ------------- |
+partición
+destino no
+31
+
+| Duplicate  |     |     | puede coincidir  |     |     |
+| ---------- | --- | --- | ---------------- | --- | --- |
+| partition  |     |     | con ninguna      |     |     |
+| name       |     |     | partición        |     |     |
+existente
+| El esquema     |     | La replicación  | En  bdd-nodo02 |    |     |
+| -------------- | --- | --------------- | -------------- | --- | --- |
+| lab_particione |     | tiene un error  | SHOW REPLICA   |     |     |
+| s  no aparece  |     | pendiente que   | STATUS\G       |  —  |     |
+| en  bdd-nodo02 |     | detiene al SQL  | buscar         |     |     |
+|                |     | thread          | Last_SQL_Erro  |     |     |
+r  resolver el
+error específico
+antes de
+continuar
+|     |     | El usuario  | Conectar con  |     |     |
+| --- | --- | ----------- | ------------- | --- | --- |
+TRUNCATE
+|           |         | conectado no  |              |     |     |
+| --------- | ------- | ------------- | ------------ | --- | --- |
+| PARTITION |  falla  |               | sudo mariadb |     |     |
+|           |         | tiene el      | (root) o     |     |     |
+con  Access
+|     |     | privilegio  DROP   | conceder  |     |     |
+| --- | --- | ------------------ | ---------- | --- | --- |
+denied
+|     |     | (necesario para  | GRANT DROP ON  |     |     |
+| --- | --- | ---------------- | -------------- | --- | --- |
+|     |     | TRUNCATE         | lab_particione |     |     |
+PARTITION)
+s.* TO
+'lab_admin'@'l
+ocalhost';
+FLUSH
+PRIVILEGES;
+| El segundo        |     | La versión de    | Verificar          |     |     |
+| ----------------- | --- | ---------------- | ------------------ | --- | --- |
+| ALTER TABLE       |     | MariaDB          | inmediatamente     |     |     |
+| lab_bdd.pedido    |     | instalada tiene  | con  SHOW          |     |     |
+| s ...             |     | un               | CREATE TABLE       |     |     |
+| PARTITION BY      |     | comportamiento   | lab_bdd.pedido     |     |     |
+| ...  modifica la  |     | diferente con    | s\G  si la tabla  |     |     |
+esta
+| tabla en lugar  |     |     | fue  |     |     |
+| --------------- | --- | --- | ---- | --- | --- |
+combinación
+| de fallar |     |     | particionada  |     |     |
+| --------- | --- | --- | -------------- | --- | --- |
+restaurar desde
+el snapshot
+fase11-
+|     |     |     | completa |  de  |     |
+| --- | --- | --- | -------- | ---- | --- |
+bdd-nodo01
+G. Checklist de validación
+|                 |     |  incluye        |     |  en        | .   |
+| --------------- | --- | --------------- | --- | ---------- | --- |
+| SHOW DATABASES; |     | lab_particiones |     | bdd-nodo01 |     |
+32
+
+SHOW TABLES IN lab_particiones;  devuelve las siete tablas de la fase.
+| clientes_list4   |  tiene cuatro particiones con 5 filas cada una. |     |            |         |     |
+| ---------------- | ----------------------------------------------- | --- | ---------- | ------- | --- |
+|                  |  tiene tres particiones tras el                 |     |            |  (      | ,   |
+| clientes_list2   |                                                 |     | REORGANIZE | p_norte |     |
+| p_este ,  frag_B | ) con 20 filas en total.                        |     |            |         |     |
+pedidos_list2  tiene dos particiones ( frag_A  y  frag_B ) con 10 pedidos
+cada una.
+|                    |  tiene cinco particiones;  |            |  está vacía tras |     |     |
+| ------------------ | -------------------------- | ---------- | ---------------- | --- | --- |
+| pedidos_range      |                            | p_anterior |                  |     |     |
+| TRUNCATE PARTITION | .                          |            |                  |     |     |
+accesos_hash  tiene cuatro particiones con distribución aproximadamente
+uniforme entre ~25 filas cada una.
+ muestra 8 segmentos en
+| clientes_subpart |     |     | INFORMATION_SCHEMA.PARTITIONS |     |     |
+| ---------------- | --- | --- | ----------------------------- | --- | --- |
+(4 particiones × 2 subparticiones) con  SUBPARTITION_NAME  no nulo.
+EXPLAIN SELECT * FROM clientes_list4 WHERE region = 'norte'  muestra
+| partitions: p_norte |  únicamente — poda activa. |     |     |     |     |
+| ------------------- | -------------------------- | --- | --- | --- | --- |
+ sin filtro muestra las cuatro
+EXPLAIN SELECT * FROM clientes_list4
+particiones — sin poda.
+EXPLAIN SELECT ... FROM pedidos_range WHERE YEAR(fecha_pedido) = 2025
+| muestra  partitions: p_2025 |     |  únicamente. |     |     |     |
+| --------------------------- | --- | ------------ | --- | --- | --- |
+ muestra las
+EXPLAIN SELECT ... FROM accesos_hash WHERE usuario_id = 1
+cuatro particiones — confirma ausencia de poda con HASH.
+El intento de agregar FK a  pedidos_list2  produjo un error; la tabla no
+fue modificada.
+El intento de particionar  lab_bdd.pedidos  produjo un error; la tabla
+original sigue intacta con 20 filas y sus FK definidas.
+lab_bdd.clientes  y  lab_bdd.pedidos  no tienen particionamiento y
+conservan sus datos originales.
+La replicación en  bdd-nodo02  sigue activa ( Replica_IO_Running: Yes ).
+lab_particiones  con sus siete tablas existe también en  bdd-nodo02 .
+| Los snapshots                               | fase12-completa |  existen en los tres nodos. |     |           |     |
+| ------------------------------------------- | --------------- | --------------------------- | --- | --------- | --- |
+| Puedo explicar la diferencia técnica entre  |                 | RANGE COLUMNS               |     |  y  RANGE |     |
+estándar (tipos de datos soportados).
+Puedo explicar por qué  HASH  no realiza poda con predicados de negocio
+sobre columnas distintas al atributo de particionamiento.
+Puedo explicar por qué las FK son incompatibles con el particionamiento
+nativo y cómo las Fases 13–15 abordan esa limitación.
+33
+
+Puedo relacionar los predicados de clientes_list2 / pedidos_list2 con los
+fragmentos frag_A y frag_B del Documento de Diseño Distribuido de la
+Fase 9.
+Preguntas teóricas para estudiantes
+ En el experimento de poda de particiones (sección D) la consulta sobre
+accesos_hash con WHERE usuario_id = 1 lee las cuatro particiones a pesar
+del filtro Sin embargo WHERE id = 42 sobre la misma tabla lee solo una
+partición Explica técnicamente por qué el predicado sobre id habilita la
+poda mientras que el predicado sobre usuario_id no aunque ambos son
+condiciones de igualdad sobre columnas de la misma tabla
+ La restricción de que el atributo de particionamiento debe estar en la clave
+primaria tiene una consecuencia sobre el comportamiento del AUTO_INCREMENT 
+en clientes_list4 con PRIMARY KEY (id, region)  dos filas en particiones
+distintas podrían tener el mismo valor de id  Explica cuándo ocurre esto
+en qué circunstancias puede ser un problema para la aplicación que consume los
+datos y qué estrategias se usan en producción para evitar colisiones de
+identificadores al distribuir datos entre nodos
+ Compara ALTER TABLE pedidos_range TRUNCATE PARTITION p_anterior con un
+DELETE FROM pedidos_range WHERE YEAR(fecha_pedido) < 2024  Ambos producen el
+mismo resultado en el contenido de la tabla pero su impacto en el motor es
+radicalmente distinto Explica las diferencias en términos de (a) tipo de
+operación (DDL vs DML) (b) generación de binlog y propagación por replicación
+© impacto en el tablespace de InnoDB y (d) tiempo de ejecución esperado para
+una tabla con  millones de filas históricas
+ El diseño de clientes_list4 (cuatro particiones una por región) y el de
+clientes_list2 (dos particiones dos regiones por partición) corresponden a dos
+estrategias distintas de fragmentación que se verán también en la Fase 
+Discute las ventajas e inconvenientes de cada estrategia en términos de
+(a) granularidad de la poda al filtrar por una sola región (b) balanceo de carga
+entre particiones o nodos y © coste de añadir un nuevo valor al dominio del
+atributo de particionamiento (por ejemplo una quinta región)
+ La incompatibilidad entre claves foráneas y particionamiento nativo refleja una
+tensión fundamental entre integridad referencial (garantizada por el motor) e
+integridad de distribución (garantizada por el esquema de particionamiento)
+Explica cómo la arquitectura del laboratorio transita de un modelo con FK nativas
+34
+
+( lab_bdd  donde la integridad la garantiza InnoDB) a un modelo sin FK
+( lab_particiones y más adelante los fragmentos de las Fases – donde la
+integridad se gestiona a nivel de aplicación) ¿Cuáles son los riesgos concretos
+de este cambio de responsabilidad?
+Ejercicios prácticos
+ Análisis de selectividad de predicados
+Para la tabla clientes_list4  escribir y ejecutar cuatro consultas EXPLAIN 
+(a) filtro por un solo valor de región ( = 'norte' ) (b) filtro por dos valores
+( IN ('norte', 'este') ) © negación ( NOT IN ('sur') ) y (d) sin filtro
+Para cada una registrar el valor de la columna partitions y el valor estimado
+de rows  Elaborar una tabla comparativa y concluir ¿la reducción de particiones
+leídas es proporcional a la reducción en el valor de rows ?
+ Particionamiento RANGE por precio de producto
+Crear en lab_particiones una tabla productos_range que copie la estructura
+de lab_bdd.productos (sin FK) y la particione por RANGE usando el campo
+precio con tres rangos
+• p_economico  precio < 
+• p_medio  precio entre  y  
+• p_premium  precio ≥  
+Poblar desde lab_bdd.productos  ejecutar ANALYZE TABLE  y verificar cuántos
+productos caen en cada rango con conteos exactos Ejecutar EXPLAIN para confirmar
+la poda con WHERE precio < 500 y con WHERE precio BETWEEN 500 AND 2000 
+Discutir si este particionamiento produciría un buen balanceo en un catálogo
+de e-commerce real con miles de productos
+ Verificación de integridad entre tablas particionadas relacionadas
+Las tablas clientes_list2 y pedidos_list2 no tienen FK entre sí pero
+comparten cliente_id  Escribir una consulta SQL que detecte registros huérfanos
+en pedidos_list2  pedidos cuyo cliente_id no existe en clientes_list2 
+Luego insertar deliberadamente un pedido con cliente_id = 999 (que no existe
+en clientes) para crear un huérfano verificar que la consulta de detección lo
+encuentra y finalmente eliminarlo Discutir ¿qué mecanismo sustituye a las FK
+en un sistema distribuido real para mantener este tipo de integridad referencial?
+35
+
+Reto adicional para alumnos avanzados
+Diseñar e implementar en lab_particiones una tabla pedidos_hibrida que combine
+subparticionamiento con RANGE por semestre en el nivel superior y KEY por cliente_id en
+el nivel inferior:
+• Nivel RANGE: dos particiones semestrales para  ( p_sem1_2025 para enero-junio
+p_sem2_2025 para julio-diciembre) más una partición p_futuro con MAXVALUE 
+• Nivel KEY:  subparticiones dentro de cada partición semestral (por cliente_id )
+El resultado debe ser una tabla con 3 × 3 = 9 segmentos de datos totales. Poblarla
+con los 20 pedidos de lab_bdd.pedidos más al menos 30 registros adicionales con
+fechas distribuidas entre los dos semestres. Verificar con INFORMATION_SCHEMA.
+PARTITIONS que los 9 segmentos existen y que los totales de filas son coherentes.
+Ejecutar EXPLAIN para una consulta que filtre por semestre (por ejemplo,
+WHERE fecha_pedido BETWEEN '2025-01-01' AND '2025-06-30' ) y confirmar que la poda
+actúa al nivel del semestre (RANGE) aunque no al nivel de subpartición (KEY).
+Redactar un párrafo justificando en qué escenario real valdría la pena esta
+complejidad de administración frente a una solución de dos nodos físicamente
+separados como se implementará en la Fase 13.
+36
+
+Criterios de evaluación para el profesor
+| Criterio | Peso | Indicador de  |     |
+| -------- | ---- | ------------- | --- |
+logro
+| Creación de      | % | Las siete tablas  |     |
+| ---------------- | --- | ----------------- | --- |
+| tablas con los   |     | existen con las   |     |
+| cuatro tipos de  |     | definiciones      |     |
+| particionamient  |     | correctas el     |     |
+| o                |     | estudiante        |     |
+puede justificar
+qué tipo de
+particionamient
+o se eligió para
+cada caso de
+uso y por qué
+| Verificación de  | % | Los  EXPLAIN  |     |
+| ---------------- | --- | ------------- | --- |
+| poda de          |     | muestran los  |     |
+| particiones      |     | valores       |     |
+esperados en la
+columna
+|     |     | partitions |     |
+| --- | --- | ---------- | --- |
+para cada tipo
+el estudiante
+interpreta la
+|     |     | columna  | rows   |
+| --- | --- | -------- | ------ |
+y puede explicar
+cuantitavamente
+el beneficio de
+la poda
+| Operaciones de  | % | Se ejecutaron  |     |
+| --------------- | --- | -------------- | --- |
+| mantenimiento   |     | correctamente  |     |
+|                 |     | REORGANIZE     |    |
+|                 |     | TRUNCATE       |    |
+|                 |     | ADD   ANALYZE |     |
+y  DROP
+|     |     | PARTITION |  el  |
+| --- | --- | --------- | ----- |
+estudiante
+puede describir
+el impacto de
+cada operación
+en los datos y
+en la replicación
+37
+
+Comprensión de % El estudiante
+la restricción FK puede
+demostrar el
+error con
+evidencia del
+intento fallido
+explicar la causa
+técnica y
+articular cómo
+las Fases –
+abordan esa
+limitación a nivel
+de aplicación
+Conexión con el % El estudiante
+DDD (Fase ) relaciona
+explícitamente
+los predicados
+de
+clientes_list
+2 / pedidos_lis
+t2 con los
+fragmentos
+frag_A / frag_
+B del
+Documento de
+Diseño
+Distribuido y
+articula la
+diferencia entre
+una partición
+local (Fase ) y
+un fragmento en
+nodo separado
+(Fase )
+Comprensión % Las respuestas
+conceptual usan
+(preguntas vocabulario
+teóricas) técnico correcto
+(poda DDL
+DML
+consistencia
+referencial
+AUTO_INCREME
+NT por
+partición) y
+38
+
+hacen referencia
+explícita al
+esquema del
+laboratorio
+Preparación para la siguiente fase
+La Fase 13: Fragmentación Horizontal requerirá:
+• El Documento de Diseño Distribuido ( C:\LabBDD\Documentacion\fase09-disenyo-
+distribuido.md )
+como referencia técnica de los predicados de fragmentación los mismos
+region IN ('norte','este') y region IN ('sur','oeste') que en esta fase
+definieron particiones locales pasarán a definir fragmentos en nodos físicos
+separados
+• Comprensión sólida de LIST COLUMNS y de la poda de particiones adquirida en
+esta fase en la Fase  se verá que el motor Spider del coordinador aplica
+internamente el mismo concepto de predicado de selección para enrutar cada
+consulta al shard correcto
+• El esquema lab_bdd intacto y replicado entre bdd-nodo01 y bdd-nodo02 
+• Snapshot fase12-completa tomado en los tres nodos
+• Dos nuevas máquinas virtuales que deben crearse al inicio de la Fase :
+bdd-nodo04 ( fragmento A) y bdd-nodo05 (
+fragmento B) Se crearán siguiendo el mismo procedimiento de instalación de las
+Fases – pero de forma compacta al ser la tercera y cuarta VM del laboratorio
+En la Fase 13 las tablas clientes , pedidos y detalle_pedidos de lab_bdd
+se cargarán en bdd-nodo04 y bdd-nodo05 con los datos ya segmentados según los
+predicados del DDD. El coordinador ( bdd-nodo06 ) no se creará hasta la Fase 14;
+en la Fase 13 se accederá directamente a cada shard para verificar los datos y las
+consultas de reconstrucción ( UNION ALL ) se ejecutarán manualmente desde
+bdd-nodo01 .
+39
+
+---
+
+# Fase 13 — Fragmentación Horizontal
+
+Fase 13 — Fragmentación Horizontal
+Materia BDD
+Continuación directa de la Fase 12. Los tres nodos activos ( bdd-nodo01 ,
+bdd-nodo02 y bdd-nodo03 ) tienen sus snapshots fase12-completa tomados.
+En esta fase se crean dos nuevas máquinas virtuales — bdd-nodo04 y
+bdd-nodo05 — que actuarán como nodos de sharding, y se carga en cada uno el
+fragmento horizontal que le corresponde según el Documento de Diseño
+Distribuido (DDD) elaborado en la Fase 9. Los datos de clientes , pedidos
+y detalle_pedidos se distribuyen físicamente entre los dos shards usando el
+atributo region como predicado de fragmentación. Al finalizar, el laboratorio
+tendrá, por primera vez, dos nodos independientes que almacenan subconjuntos
+disjuntos de los mismos datos: una fragmentación horizontal real y no una
+simulación local como el particionamiento nativo de la Fase 12.
+A. Objetivos de aprendizaje
+Al finalizar esta fase, el estudiante será capaz de:
+ Crear nuevos nodos del laboratorio mediante clones enlazados (linked
+clones) de VirtualBox a partir de un snapshot base aplicando el mismo
+patrón de aprovisionamiento rápido utilizado en la Fase  para bdd-nodo03 
+ Configurar la identidad de cada nodo shard (hostname IP estática server_id
+de MariaDB) para que coexistan sin conflicto en la red Host-Only
+ Implementar la estrategia de carga de fragmentos usando mysqldump
+--where para tablas con atributo de fragmentación explícito y tablas
+temporales materializadas para fragmentos derivados sin columna propia de
+partición
+ Aplicar correctamente la fragmentación derivada de detalle_pedidos 
+co-localizando cada línea de detalle con el fragmento del pedido padre al que
+pertenece
+ Justificar y demostrar por qué los esquemas de los nodos shard no incluyen
+claves foráneas y cómo la co-localización preserva la integridad referencial
+por diseño
+1
+
+ Verificar las tres condiciones de correctitud (completitud disjunción
+reconstrucción) de la fragmentación horizontal sobre los datos reales cargados
+en nodo y nodo
+ Construir la consulta de reconstrucción UNION ALL que el coordinador
+(nodo) ejecutará en la Fase  y validarla manualmente desde nodo
+ Distinguir con precisión la diferencia entre el particionamiento nativo de
+MariaDB (Fase  datos en un solo servidor) y la fragmentación distribuida
+(Fase  datos en servidores físicamente separados)
+ Cerrar la fase con los snapshots fase13-completa en los cinco nodos activos
+del laboratorio
+B. Conceptos teóricos necesarios
+1. Diferencia operacional entre particionamiento nativo y fragmentación
+distribuida.
+En la Fase 12 se demostró el particionamiento nativo: las filas se dividen en
+segmentos físicos dentro del mismo servidor. El optimizador de MariaDB conoce
+todos los segmentos, gestiona las transacciones a través de ellos y puede aplicar
+poda de particiones en tiempo de ejecución. En esta fase los fragmentos residen
+en servidores físicamente distintos: nodo04 y nodo05 son dos instancias
+independientes de MariaDB que no comparten disco, memoria ni proceso. La
+diferencia más importante es que ningún motor puede garantizar atomicidad ni
+integridad referencial cruzando la frontera de red entre ambos nodos.
+2
+
+| Característica | Particionamient | Fragmentación  |
+| -------------- | --------------- | -------------- |
+|                | o nativo (Fase  | distribuida    |
+|                | )             | (Fase )      |
+| Ubicación de   | Un único        | Múltiples      |
+| datos          | servidor        | servidores     |
+físicamente
+separados
+| Transparencia | Total el cliente  | Requiere     |
+| ------------- | ------------------ | ------------ |
+|               | ignora los         | coordinador  |
+|               | segmentos          | (nodo     |
+Fase )
+| Claves foráneas | No soportadas   | No soportadas    |
+| --------------- | --------------- | ---------------- |
+|                 | entre tablas    | entre nodos      |
+|                 | particionadas   | distintos        |
+| Escalabilidad   | Vertical (más   | Horizontal       |
+|                 | recursos al     | (agregar más     |
+|                 | mismo servidor) | nodos)           |
+| Objetivo        | Rendimiento y   | Escalabilidad y  |
+| principal       | mantenimiento   | disponibilidad   |
+2. Fragmentación horizontal primaria y derivada.
+La fragmentación horizontal divide las filas de una relación en subconjuntos
+disjuntos, cada uno definido por un predicado de selección:
+•
+Fragmentación primaria el predicado se aplica directamente sobre una columna
+de la propia tabla  clientes  y  pedidos  tienen la columna  region  por lo
+que los predicados   y
+frag_A: region IN ('norte','este') frag_B: region
+| IN ('sur','oeste') |  actúan directamente |     |
+| ------------------ | --------------------- | --- |
+• Fragmentación derivada la tabla hija no tiene columna de fragmentación
+propia y se fragmenta siguiendo la distribución de su tabla padre a través de
+la clave foránea  detalle_pedidos  no tiene columna  region  se fragmenta
+derivadamente a través de  pedido_id → pedidos.id  las líneas cuyo pedido está
+en frag_A van a nodo y las del frag_B van a nodo
+3. Co-localización de tablas relacionadas.
+Cuando dos tablas se fragmentan bajo el mismo predicado y sus fragmentos se
+asignan al mismo nodo se dice que están co-localizadas. La co-localización es
+la condición que permite ejecutar JOINs completamente dentro del mismo nodo sin
+3
+
+transferencia de datos por red — la operación más costosa en un sistema
+distribuido. En este laboratorio:
+• clientes_frag_A + pedidos_frag_A + detalle_frag_A → co-localizadas en nodo
+• clientes_frag_B + pedidos_frag_B + detalle_frag_B → co-localizadas en nodo
+Esta co-localización permite que la consulta JOIN clientes → pedidos →
+detalle_pedidos se resuelva íntegramente dentro de un único nodo para cada
+región, sin cruzar la red.
+4. Integridad referencial en un sistema distribuido.
+MariaDB no puede imponer claves foráneas ( FOREIGN KEY ) entre tablas de
+servidores distintos. En el sistema centralizado de nodo01, InnoDB garantiza
+automáticamente que todo pedido.cliente_id existe en clientes.id . En los
+shards esta garantía desaparece y la responsabilidad se transfiere a uno de los
+siguientes mecanismos:
+• Validación en la capa de aplicación el código verifica la existencia del
+cliente antes de insertar un pedido
+• Scripts de auditoría periódica consultas que detectan filas huérfanas de
+forma programada
+• Lógica en el coordinador nodo (Fase ) puede imponer restricciones
+lógicas antes de enrutar escrituras a los shards
+En este laboratorio la co-localización de clientes y pedidos por el mismo
+predicado garantiza de hecho que el cliente referenciado por cada pedido
+siempre estará en el mismo nodo, preservando la integridad por diseño sin
+necesidad de FK de motor.
+5. Clon enlazado (linked clone) en VirtualBox.
+Un clon enlazado comparte el disco base del snapshot de origen con la VM
+original y solo almacena las diferencias (delta disk). Ventajas para este
+laboratorio:
+• Se crea en segundos (no copia gigabytes de datos solo referencia el disco
+base)
+• Ocupa muy poco espacio inicial en disco
+• Se provisiona con el mismo SO MariaDB y datos de prueba que el nodo fuente
+4
+
+La contrapartida es que el snapshot de origen no puede eliminarse mientras exista
+el clon enlazado. Como este laboratorio conserva todos los snapshots, esto es
+irrelevante en la práctica.
+6. Estrategia de carga de fragmentos con mysqldump .
+mysqldump --where exporta solo las filas que cumplan un predicado SQL,
+generando sentencias INSERT INTO exclusivas para ese fragmento. Para tablas
+con columna de fragmentación explícita ( clientes , pedidos ):
+Text
+mysqldump --no-create-info --where="region IN ('norte','este')"
+lab_bdd clientes
+Para detalle_pedidos (fragmentación derivada, sin columna region ) se crea
+una tabla temporal en nodo01 que materializa las filas del fragmento mediante un
+JOIN. Esa tabla temporal se exporta con mysqldump --no-create-info y un sed
+sustituye el nombre de la tabla temporal por detalle_pedidos antes de
+importarlo en el shard.
+7. Carga completa de productos en ambos shards.
+La tabla productos no se fragmenta horizontalmente en esta fase; lo hará
+verticalmente en la Fase 14 (dos fragmentos: V_productos_basico en nodo04 y
+V_productos_detalle en nodo05). Para que los JOINs entre detalle_pedidos y
+productos puedan resolverse localmente en cada shard antes de que exista el
+coordinador, se carga el catálogo completo (10 filas) en ambos nodos. Esta
+replicación temporal se sustituirá en la Fase 14 por la fragmentación vertical
+definitiva.
+C. Procedimiento paso a paso
+Paso 1 — Apagar todos los nodos activos del laboratorio.
+La creación de los clones requiere que nodo01 esté detenido para evitar
+conflictos de IP con los clones que arrancarán temporalmente con la misma
+dirección.
+5
+
+Paso 2 — Crear  bdd-nodo04  como clon enlazado del snapshot  fase08-completa  de
+nodo01.
+| Se elige  |     |  porque es el último snapshot que contiene MariaDB |     |     |
+| --------- | --- | -------------------------------------------------- | --- | --- |
+fase08-completa
+instalado sin configuración de replicación — la base más limpia para un nodo
+shard autónomo.
+| Paso 3 — Configuración inicial de  |     |     |     | .   |
+| ---------------------------------- | --- | --- | --- | --- |
+bdd-nodo04
+Arrancar solo nodo04, conectar mediante SSH a la IP heredada del clon
+(192.168.56.101), y reconfigurar hostname, IP estática (.104), regenerar claves
+SSH y ajustar MariaDB (server_id=4, bind-address=0.0.0.0).
+Paso 4 — Crear  bdd-nodo05  como clon enlazado del snapshot  fase08-completa  de
+nodo01.
+Mismo proceso que el Paso 2; nodo04 puede seguir corriendo en .104 sin conflicto.
+| Paso 5 — Configuración inicial de  |     |     | bdd-nodo05 | .   |
+| ---------------------------------- | --- | --- | ---------- | --- |
+Arrancar nodo05 (hereda .101), conectar via SSH y reconfigurar hacia .105 con
+| hostname  | bdd-nodo05 |  y server_id=5. |     |     |
+| --------- | ---------- | --------------- | --- | --- |
+Paso 6 — Reiniciar nodo01 y preparar la distribución de datos.
+Con los tres nodos corriendo en IPs distintas (.101, .104, .105), crear el
+usuario de lectura para los shards ( shard_pull ) y materializar las tablas
+| temporales de              | detalle_pedidos |     |  para cada fragmento. |     |
+| -------------------------- | --------------- | --- | --------------------- | --- |
+| Paso 7 — Crear el esquema  |                 |     |  en nodo04 y nodo05.  |     |
+lab_bdd
+Esquema sin claves foráneas, con la misma estructura de columnas que nodo01
+| (incluyendo      | ultima_modificacion |             |  añadida en la Fase 10). |     |
+| ---------------- | ------------------- | ----------- | ------------------------ | --- |
+| Paso 8 — Cargar  | frag_A              |  en nodo04. |                          |     |
+Importar  clientes ,  pedidos ,  detalle_pedidos  (fragmento A) y  productos
+| completo, tirando datos vía  |     |     |  desde nodo04 hacia nodo01. |     |
+| ---------------------------- | --- | --- | --------------------------- | --- |
+mysqldump
+| Paso 9 — Cargar  | frag_B |  en nodo05. |     |     |
+| ---------------- | ------ | ----------- | --- | --- |
+Misma secuencia para el fragmento B.
+Paso 10 — Verificar correctitud de fragmentación en ambos shards.
+Confirmar completitud, disjunción, co-localización y que los JOINs locales
+producen resultados correctos sin acceder a datos de otro nodo.
+6
+
+Paso 11 — Demostrar la reconstrucción global desde nodo01.
+Ejecutar consultas de conteo en los tres nodos, confirmar que frag_A + frag_B
+= total de nodo01, y mostrar la consulta UNION ALL que el coordinador ejecutará
+en la Fase 14.
+Paso 12 — Limpieza en nodo01.
+Eliminar tablas temporales y usuarios de transferencia.
+Paso 13 — Apagar los nodos y tomar el snapshot fase13-completa en los cinco
+nodos.
+D. Comandos completos
+Los bloques (host) se ejecutan en PowerShell en Windows. Los bloques
+(VM — nodoXX) se ejecutan en una sesión SSH al nodo indicado. Los bloques
+SQL dentro de sudo mariadb se ejecutan en el prompt del motor.
+D.1 Apagar todos los nodos activos (host)
+PowerShell
+# Señal de apagado ordenado a cada nodo que pueda estar corriendo
+# Los nodos que ya estén apagados devolverán un mensaje informativo sin error
+VBoxManage controlvm "bdd-nodo01" acpipowerbutton 2>$null
+VBoxManage controlvm "bdd-nodo02" acpipowerbutton 2>$null
+VBoxManage controlvm "bdd-nodo03" acpipowerbutton 2>$null
+# Esperar a que Ubuntu cierre limpiamente todos los servicios
+Start-Sleep -Seconds 35
+# Confirmar que no queda ninguna VM corriendo
+VBoxManage list runningvms
+La salida debe estar vacía. Si algún nodo persiste en la lista, esperar 15
+segundos más y verificar de nuevo. En caso excepcional, forzar el estado
+guardado:
+7
+
+PowerShell
+VBoxManage controlvm "bdd-nodo01" savestate
+D.2 Crear bdd-nodo04 como clon enlazado (host)
+PowerShell
+# Clon enlazado de nodo01 desde el snapshot fase08-completa.
+# fase08-completa = Ubuntu Server + MariaDB 10.11 + lab_bdd poblado
+# SIN ningún archivo de replicación (60-replication-*.cnf)
+# → base ideal para un nodo shard autónomo
+VBoxManage clonevm "bdd-nodo01" `
+--snapshot "fase08-completa" `
+--options linked `
+--name "bdd-nodo04" `
+--basefolder "C:\LabBDD\VMs" `
+--register
+# Añadir descripción de rol para referencia futura
+VBoxManage modifyvm "bdd-nodo04" `
+--description "SHARD-A — Fragmento horizontal frag_A (region norte+este). IP
+192.168.56.104. Fase 13."
+# Confirmar el registro
+VBoxManage showvminfo "bdd-nodo04" | Select-String "Name:|State:|Memory:"
+Salida esperada:
+Text
+Name: bdd-nodo04
+Memory size: 1536 MB
+State: powered off (...)
+D.3 Configuración inicial de bdd-nodo04 (host + VM)
+Arrancar solo nodo04 (nodo01 sigue apagado → no hay conflicto de IP):
+8
+
+PowerShell
+VBoxManage startvm "bdd-nodo04" --type headless
+Start-Sleep -Seconds 35
+Conectar por SSH a la IP heredada del clon (aún es .101, porque nodo01 está
+apagado):
+PowerShell
+ssh bddadmin@192.168.56.101
+Ejecutar en la sesión SSH (VM — nodo04):
+Bash
+# ── 1. Cambiar el hostname ────────────────────────────────────
+sudo hostnamectl set-hostname bdd-nodo04
+# El archivo /etc/hosts tiene "bdd-nodo01"; actualizarlo
+sudo sed -i 's/bdd-nodo01/bdd-nodo04/g' /etc/hosts
+# Verificar
+hostnamectl status | grep "Static hostname"
+# Esperado: Static hostname: bdd-nodo04
+Bash
+# ── 2. Cambiar la IP estática de .101 a .104 ─────────────────
+# Identificar el archivo de configuración de netplan
+NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -1)
+echo "Archivo: $NETPLAN_FILE"
+# Ver configuración actual (mostrará 192.168.56.101)
+cat "$NETPLAN_FILE"
+# Reemplazar la dirección IP
+sudo sed -i 's/192\.168\.56\.101/192.168.56.104/g' "$NETPLAN_FILE"
+# Confirmar el cambio antes de aplicar
+grep "192.168" "$NETPLAN_FILE"
+# Aplicar — la sesión SSH se interrumpirá en este momento
+sudo netplan apply
+9
+
+La sesión SSH se pierde al cambiar la IP. Reconectar desde el host a la
+nueva dirección:
+PowerShell
+# Nueva ventana de PowerShell → conectar a la IP nueva de nodo04
+ssh bddadmin@192.168.56.104
+Continuar la configuración (VM — nodo04):
+Bash
+# ── 3. Verificar la nueva IP ──────────────────────────────────
+ip addr show | grep "192.168.56"
+# Esperado: inet 192.168.56.104/24
+ping -c 2 192.168.56.1 # host Windows — debe responder
+Bash
+# ── 4. Regenerar las claves SSH del host del nodo ────────────
+# El clon hereda las claves SSH de nodo01; se generan nuevas
+# únicas para nodo04 (buena práctica de seguridad)
+sudo rm -f /etc/ssh/ssh_host_*
+sudo ssh-keygen -A
+sudo systemctl restart ssh
+echo "Claves SSH regeneradas:"
+ls -la /etc/ssh/ssh_host_*.pub
+10
+
+Bash
+# ── 5. Configurar MariaDB para el rol de shard ───────────────
+# a) Cambiar bind-address en 50-server.cnf para aceptar
+# conexiones remotas (heredado como 127.0.0.1 del clon)
+sudo sed -i \
+'s/^bind-address[](:space:)*=.*/bind-address = 0.0.0.0/' \
+/etc/mysql/mariadb.conf.d/50-server.cnf
+# Verificar el cambio
+grep bind-address /etc/mysql/mariadb.conf.d/50-server.cnf
+# b) Crear archivo de configuración del shard
+sudo tee /etc/mysql/mariadb.conf.d/61-shard-config.cnf > /dev/null << 'EOF'
+# =====================================================
+# Configuración de nodo shard A — bdd-nodo04
+# IP: 192.168.56.104 | server_id: 4
+# Fase 13 — Fragmentación Horizontal (frag_A: norte+este)
+# Mapa de server_id del laboratorio:
+# nodo01=1, nodo02=2, nodo03=3, nodo04=4, nodo05=5, nodo06=6
+# =====================================================
+[mariadb]
+server_id = 4
+# Binary log no requerido en shards para esta fase
+# (se habilitará si se necesita replicación del shard en fases avanzadas)
+skip_name_resolve = ON
+EOF
+# c) Reiniciar y verificar
+sudo systemctl restart mariadb
+sudo systemctl status mariadb --no-pager -l | head -5
+sudo mariadb -e "SHOW VARIABLES LIKE 'server_id';"
+sudo mariadb -e "SHOW VARIABLES LIKE 'bind_address';"
+sudo mariadb -e "SHOW VARIABLES LIKE 'log_bin';"
+Salida esperada:
+• server_id : 
+• bind_address : 
+• log_bin : OFF (sin binary log en el shard)
+11
+
+Bash
+# ── 6. Crear el usuario de verificación para nodo01 ──────────
+# nodo01 usará este usuario en D.11 para leer datos del shard
+# y verificar la reconstrucción UNION ALL
+sudo mariadb << 'EOF'
+CREATE USER IF NOT EXISTS 'shard_verify'@'192.168.56.101'
+IDENTIFIED BY 'ShardVerify_2025!';
+-- El GRANT sobre lab_bdd se otorgará después de crear el esquema (D.7)
+SELECT User, Host FROM mysql.user WHERE User = 'shard_verify';
+EOF
+Dejar la sesión SSH de nodo04 abierta. Abrir una nueva ventana de PowerShell
+para el siguiente paso.
+D.4 Crear bdd-nodo05 como clon enlazado (host — nueva ventana)
+PowerShell
+# nodo04 está corriendo en .104; nodo01 sigue apagado
+# nodo05 arrancará temporalmente con .101 (sin conflicto: nodo01 está off)
+VBoxManage clonevm "bdd-nodo01" `
+--snapshot "fase08-completa" `
+--options linked `
+--name "bdd-nodo05" `
+--basefolder "C:\LabBDD\VMs" `
+--register
+VBoxManage modifyvm "bdd-nodo05" `
+--description "SHARD-B — Fragmento horizontal frag_B (region sur+oeste). IP
+192.168.56.105. Fase 13."
+VBoxManage showvminfo "bdd-nodo05" | Select-String "Name:|State:"
+12
+
+D.5 Configuración inicial de bdd-nodo05 (host + VM)
+PowerShell
+VBoxManage startvm "bdd-nodo05" --type headless
+Start-Sleep -Seconds 35
+# nodo04 corre en .104; nodo01 sigue apagado
+# → nodo05 arrancó con .101 sin conflicto
+ssh bddadmin@192.168.56.101
+(VM — nodo05):
+Bash
+# ── 1. Hostname ──────────────────────────────────────────────
+sudo hostnamectl set-hostname bdd-nodo05
+sudo sed -i 's/bdd-nodo01/bdd-nodo05/g' /etc/hosts
+hostnamectl status | grep "Static hostname"
+Bash
+# ── 2. Cambiar IP a .105 ─────────────────────────────────────
+NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -1)
+sudo sed -i 's/192\.168\.56\.101/192.168.56.105/g' "$NETPLAN_FILE"
+grep "192.168" "$NETPLAN_FILE"
+sudo netplan apply # la sesión SSH se interrumpe aquí
+Reconectar a la nueva IP:
+PowerShell
+ssh bddadmin@192.168.56.105
+(VM — nodo05) — continuar:
+13
+
+Bash
+# ── 3. Verificar IP ───────────────────────────────────────────
+ip addr show | grep "192.168.56"
+# Esperado: inet 192.168.56.105/24
+Bash
+# ── 4. Regenerar claves SSH ───────────────────────────────────
+sudo rm -f /etc/ssh/ssh_host_*
+sudo ssh-keygen -A
+sudo systemctl restart ssh
+Bash
+# ── 5. Configurar MariaDB ─────────────────────────────────────
+sudo sed -i \
+'s/^bind-address[](:space:)*=.*/bind-address = 0.0.0.0/' \
+/etc/mysql/mariadb.conf.d/50-server.cnf
+sudo tee /etc/mysql/mariadb.conf.d/61-shard-config.cnf > /dev/null << 'EOF'
+# =====================================================
+# Configuración de nodo shard B — bdd-nodo05
+# IP: 192.168.56.105 | server_id: 5
+# Fase 13 — Fragmentación Horizontal (frag_B: sur+oeste)
+# =====================================================
+[mariadb]
+server_id = 5
+skip_name_resolve = ON
+EOF
+sudo systemctl restart mariadb
+sudo mariadb -e "SHOW VARIABLES LIKE 'server_id';"
+sudo mariadb -e "SHOW VARIABLES LIKE 'bind_address';"
+14
+
+Bash
+# ── 6. Usuario de verificación ────────────────────────────────
+sudo mariadb << 'EOF'
+CREATE USER IF NOT EXISTS 'shard_verify'@'192.168.56.101'
+  IDENTIFIED BY 'ShardVerify_2025!';
+SELECT User, Host FROM mysql.user WHERE User = 'shard_verify';
+EOF
+En este punto el laboratorio tiene tres nodos corriendo sin conflictos de IP:
+| Nodo       | IP            | Estado         |
+| ---------- | ------------- | -------------- |
+| bdd-nodo |  | En ejecución  |
+|            |              | shard A        |
+configurado
+| bdd-nodo |  | En ejecución  |
+| ---------- | ------------- | -------------- |
+|            |              | shard B        |
+configurado
+| bdd-nodo | —   | Apagado (se  |
+| ---------- | --- | ------------ |
+inicia en el
+siguiente paso)
+D.6 Reiniciar nodo01 y preparar la distribución de datos (host + VM)
+PowerShell
+VBoxManage startvm "bdd-nodo01" --type headless
+Start-Sleep -Seconds 35
+# Ahora los tres nodos corren en IPs distintas sin conflicto
+ssh bddadmin@192.168.56.101
+(VM — nodo01):
+15
+
+Bash
+# ── 1. Verificar conectividad con los shards ─────────────────
+ping -c 3 192.168.56.104 # nodo04
+ping -c 3 192.168.56.105 # nodo05
+# ── 2. Confirmar que la replicación física sigue activa ──────
+sudo mariadb -e "SHOW MASTER STATUS\G"
+# Debe mostrar File y Position activos
+Bash
+# ── 3. Crear el usuario que los shards usarán para leer datos
+# de nodo01 (estrategia pull: el shard conecta a nodo01
+# y tira los datos via mysqldump)
+sudo mariadb << 'EOF'
+CREATE USER IF NOT EXISTS 'shard_pull'@'192.168.56.104'
+IDENTIFIED BY 'ShardPull_2025!';
+GRANT SELECT ON lab_bdd.* TO 'shard_pull'@'192.168.56.104';
+CREATE USER IF NOT EXISTS 'shard_pull'@'192.168.56.105'
+IDENTIFIED BY 'ShardPull_2025!';
+GRANT SELECT ON lab_bdd.* TO 'shard_pull'@'192.168.56.105';
+FLUSH PRIVILEGES;
+-- Verificar
+SELECT User, Host FROM mysql.user WHERE User = 'shard_pull';
+EOF
+16
+
+Bash
+# ── 4. Materializar las tablas temporales de detalle_pedidos ──
+# detalle_pedidos no tiene columna region (fragmentación derivada).
+# Se crean dos tablas temporales en nodo01 que materializan cada
+# fragmento mediante un JOIN con pedidos.
+# Estas tablas se exportan con mysqldump --no-create-info para
+# que los shards puedan importarlas con un simple sed del nombre.
+#
+# NOTA: estos CREATE TABLE se replicarán a nodo02/nodo03.
+# Los correspondientes DROP TABLE al final de la fase también
+# se replicarán, dejando ambos esclavos en estado limpio.
+sudo mariadb lab_bdd << 'EOF'
+DROP TABLE IF EXISTS tmp_detalle_frag_A;
+CREATE TABLE tmp_detalle_frag_A
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+SELECT dp.id, dp.pedido_id, dp.producto_id,
+dp.cantidad, dp.precio_unitario, dp.subtotal
+FROM detalle_pedidos dp
+JOIN pedidos p ON p.id = dp.pedido_id
+WHERE p.region IN ('norte','este');
+DROP TABLE IF EXISTS tmp_detalle_frag_B;
+CREATE TABLE tmp_detalle_frag_B
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+SELECT dp.id, dp.pedido_id, dp.producto_id,
+dp.cantidad, dp.precio_unitario, dp.subtotal
+FROM detalle_pedidos dp
+JOIN pedidos p ON p.id = dp.pedido_id
+WHERE p.region IN ('sur','oeste');
+-- Verificar la distribución y que la suma es completa
+SELECT 'tmp_detalle_frag_A' AS fragmento, COUNT(*) AS filas
+FROM tmp_detalle_frag_A
+UNION ALL
+SELECT 'tmp_detalle_frag_B', COUNT(*)
+FROM tmp_detalle_frag_B
+UNION ALL
+SELECT 'detalle_pedidos (total original)', COUNT(*)
+FROM detalle_pedidos;
+EOF
+Resultado esperado (los valores exactos dependen de los datos de la Fase 8):
+• tmp_detalle_frag_A  ~ filas
+17
+
+| • tmp_detalle_frag_B |  ~ filas |     |
+| -------------------- | ----------- | --- |
+• detalle_pedidos (total) :  filas — la suma de A y B debe ser exactamente 
+| D.7 Crear el esquema  | lab_bdd |  en nodo04 y nodo05 |
+| --------------------- | ------- | ------------------- |
+El DDL es idéntico en ambos shards. Ejecutar primero en nodo04 y luego en
+nodo05.
+En nodo04 (VM — nodo04):
+18
+
+Bash
+sudo mariadb << 'EOF'
+-- Eliminar la base de datos completa heredada del clon
+-- (contiene los 20 clientes, 10 productos, etc. de la Fase 8
+-- pero SIN la columna ultima_modificacion añadida en la Fase 10)
+DROP DATABASE IF EXISTS lab_bdd;
+-- Crear el esquema del shard
+CREATE DATABASE lab_bdd
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_unicode_ci;
+USE lab_bdd;
+-- ============================================================
+-- TABLA: clientes
+-- SIN FK. INCLUYE ultima_modificacion (añadida en nodo01 en
+-- la Fase 10 vía ALTER TABLE replicado).
+-- ============================================================
+CREATE TABLE clientes (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+email VARCHAR(150),
+telefono VARCHAR(20),
+region ENUM('norte','sur','este','oeste') NOT NULL,
+ciudad VARCHAR(100),
+fecha_alta DATETIME DEFAULT CURRENT_TIMESTAMP,
+ultima_modificacion DATETIME DEFAULT CURRENT_TIMESTAMP
+ON UPDATE CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uk_email (email),
+KEY idx_region (region)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento horizontal de clientes — sin FK
+(integridad distribuida)';
+-- ============================================================
+-- TABLA: productos
+-- Catálogo COMPLETO en ambos shards (temporal hasta Fase 14).
+-- En la Fase 14 se reemplazará por los dos fragmentos verticales
+-- (V_productos_basico en nodo04 / V_productos_detalle en nodo05).
+-- ============================================================
+CREATE TABLE productos (
+id INT NOT NULL AUTO_INCREMENT,
+sku VARCHAR(50) NOT NULL,
+nombre VARCHAR(200) NOT NULL,
+categoria VARCHAR(100),
+19
+
+descripcion TEXT,
+ficha_tecnica TEXT,
+imagen_url VARCHAR(500),
+precio DECIMAL(10,2) NOT NULL,
+stock INT DEFAULT 0,
+peso_kg DECIMAL(8,3),
+fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uk_sku (sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Catálogo completo — fragmentación vertical pendiente (Fase 14)';
+-- ============================================================
+-- TABLA: pedidos
+-- SIN FK hacia clientes.
+-- La co-localización (mismo predicado region) garantiza que el
+-- cliente referenciado por cada pedido existe en este mismo nodo.
+-- ============================================================
+CREATE TABLE pedidos (
+id INT NOT NULL AUTO_INCREMENT,
+cliente_id INT NOT NULL,
+region ENUM('norte','sur','este','oeste') NOT NULL,
+fecha_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+estado ENUM('pendiente','procesado','enviado',
+'entregado','cancelado') DEFAULT 'pendiente',
+total DECIMAL(10,2),
+PRIMARY KEY (id),
+KEY idx_cliente (cliente_id),
+KEY idx_region (region)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento horizontal de pedidos — sin FK (integridad por
+co-localización)';
+-- ============================================================
+-- TABLA: detalle_pedidos
+-- SIN FK hacia pedidos ni hacia productos.
+-- Co-localizada con el fragmento de pedidos de este shard.
+-- ============================================================
+CREATE TABLE detalle_pedidos (
+id INT NOT NULL AUTO_INCREMENT,
+pedido_id INT NOT NULL,
+producto_id INT NOT NULL,
+cantidad INT NOT NULL DEFAULT 1,
+precio_unitario DECIMAL(10,2) NOT NULL,
+subtotal DECIMAL(10,2),
+PRIMARY KEY (id),
+KEY idx_pedido (pedido_id),
+20
+
+KEY idx_producto (producto_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento derivado de detalle_pedidos — co-localizado
+con pedidos';
+-- Verificar estructura resultante
+SHOW TABLES IN lab_bdd;
+EOF
+En nodo05 (VM — nodo05): ejecutar el bloque anterior sin modificar ninguna
+línea — el esquema es idéntico en ambos shards. Solo el contenido de los datos
+diferirá tras la carga.
+21
+
+Bash
+# Este bloque se ejecuta en nodo05; es IDÉNTICO al de nodo04
+sudo mariadb << 'EOF'
+DROP DATABASE IF EXISTS lab_bdd;
+CREATE DATABASE lab_bdd
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_unicode_ci;
+USE lab_bdd;
+CREATE TABLE clientes (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+email VARCHAR(150),
+telefono VARCHAR(20),
+region ENUM('norte','sur','este','oeste') NOT NULL,
+ciudad VARCHAR(100),
+fecha_alta DATETIME DEFAULT CURRENT_TIMESTAMP,
+ultima_modificacion DATETIME DEFAULT CURRENT_TIMESTAMP
+ON UPDATE CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uk_email (email),
+KEY idx_region (region)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento horizontal de clientes — sin FK
+(integridad distribuida)';
+CREATE TABLE productos (
+id INT NOT NULL AUTO_INCREMENT,
+sku VARCHAR(50) NOT NULL,
+nombre VARCHAR(200) NOT NULL,
+categoria VARCHAR(100),
+descripcion TEXT,
+ficha_tecnica TEXT,
+imagen_url VARCHAR(500),
+precio DECIMAL(10,2) NOT NULL,
+stock INT DEFAULT 0,
+peso_kg DECIMAL(8,3),
+fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uk_sku (sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Catálogo completo — fragmentación vertical pendiente (Fase 14)';
+CREATE TABLE pedidos (
+id INT NOT NULL AUTO_INCREMENT,
+cliente_id INT NOT NULL,
+22
+
+region ENUM('norte','sur','este','oeste') NOT NULL,
+fecha_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+estado ENUM('pendiente','procesado','enviado',
+'entregado','cancelado') DEFAULT 'pendiente',
+total DECIMAL(10,2),
+PRIMARY KEY (id),
+KEY idx_cliente (cliente_id),
+KEY idx_region (region)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento horizontal de pedidos — sin FK (integridad por
+co-localización)';
+CREATE TABLE detalle_pedidos (
+id INT NOT NULL AUTO_INCREMENT,
+pedido_id INT NOT NULL,
+producto_id INT NOT NULL,
+cantidad INT NOT NULL DEFAULT 1,
+precio_unitario DECIMAL(10,2) NOT NULL,
+subtotal DECIMAL(10,2),
+PRIMARY KEY (id),
+KEY idx_pedido (pedido_id),
+KEY idx_producto (producto_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Fragmento derivado de detalle_pedidos — co-localizado
+con pedidos';
+SHOW TABLES IN lab_bdd;
+EOF
+Otorgar el privilegio SELECT al usuario shard_verify (creado en D.3/D.5) ahora
+que el esquema existe. Ejecutar en nodo04 y en nodo05:
+23
+
+Bash
+# En nodo04:
+sudo mariadb << 'EOF'
+GRANT SELECT ON lab_bdd.* TO 'shard_verify'@'192.168.56.101';
+FLUSH PRIVILEGES;
+SHOW GRANTS FOR 'shard_verify'@'192.168.56.101';
+EOF
+# En nodo05 (sesión SSH separada):
+sudo mariadb << 'EOF'
+GRANT SELECT ON lab_bdd.* TO 'shard_verify'@'192.168.56.101';
+FLUSH PRIVILEGES;
+SHOW GRANTS FOR 'shard_verify'@'192.168.56.101';
+EOF
+D.8 Cargar frag_A en nodo04 (VM — nodo04)
+Los cuatro bloques siguientes se ejecutan desde la sesión SSH de nodo04.
+mysqldump conecta hacia nodo01 (fuente) y la salida se canaliza directamente
+al cliente local sudo mariadb lab_bdd .
+Bash
+# ── 1. Clientes — fragmento A ────────────────────────────────
+# --no-create-info : solo INSERT INTO, no CREATE TABLE
+# --skip-triggers : no copiar triggers del esquema centralizado
+# --where : predicado del fragmento A según el DDD
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+--where="region IN ('norte','este')" \
+lab_bdd clientes | \
+sudo mariadb lab_bdd
+echo ">>> Clientes frag_A importados."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS clientes_cargados FROM clientes;"
+24
+
+Bash
+# ── 2. Pedidos — fragmento A ─────────────────────────────────
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+--where="region IN ('norte','este')" \
+lab_bdd pedidos | \
+sudo mariadb lab_bdd
+echo ">>> Pedidos frag_A importados."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS pedidos_cargados FROM pedidos;"
+Bash
+# ── 3. detalle_pedidos — fragmento derivado A ────────────────
+# Se exporta la tabla temporal tmp_detalle_frag_A (creada en D.6)
+# y sed renombra la tabla en los INSERT antes de importar.
+# Resultado: INSERT INTO `detalle_pedidos` (...) en lugar de
+# INSERT INTO `tmp_detalle_frag_A` (...)
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+lab_bdd tmp_detalle_frag_A | \
+sed 's/`tmp_detalle_frag_A`/`detalle_pedidos`/g' | \
+sudo mariadb lab_bdd
+echo ">>> detalle_pedidos frag_A importado."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS detalles_cargados
+FROM detalle_pedidos;"
+25
+
+Bash
+# ── 4. Productos — catálogo COMPLETO (10 filas) ───────────────
+# Sin filtro --where: se cargan todos los productos.
+# Esto es temporal; en la Fase 14 productos se fragmentará
+# verticalmente y este bloque se eliminará.
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+lab_bdd productos | \
+sudo mariadb lab_bdd
+echo ">>> Productos importados."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS productos_cargados
+FROM productos;"
+Bash
+# ── 5. Resumen de carga en nodo04 ────────────────────────────
+sudo mariadb lab_bdd -e "
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos;"
+Resultado esperado en nodo04:
+26
+
+Text
++-----------------+-------+
+| tabla | filas |
++-----------------+-------+
+| clientes | 10 | ← frag_A: norte+este únicamente
+| productos | 10 | ← catálogo completo (temporal)
+| pedidos | 10 | ← frag_A: norte+este únicamente
+| detalle_pedidos | 18 | ← aprox.; co-localizado con pedidos_frag_A
++-----------------+-------+
+(el número exacto de detalle_pedidos puede ser 17, 18 o 19 según la
+distribución aleatoria de los datos de prueba generados en la Fase 8)
+D.9 Cargar frag_B en nodo05 (VM — nodo05)
+Bash
+# ── 1. Clientes — fragmento B ────────────────────────────────
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+--where="region IN ('sur','oeste')" \
+lab_bdd clientes | \
+sudo mariadb lab_bdd
+echo ">>> Clientes frag_B importados."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS clientes_cargados FROM clientes;"
+27
+
+Bash
+# ── 2. Pedidos — fragmento B ─────────────────────────────────
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+--where="region IN ('sur','oeste')" \
+lab_bdd pedidos | \
+sudo mariadb lab_bdd
+echo ">>> Pedidos frag_B importados."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS pedidos_cargados FROM pedidos;"
+Bash
+# ── 3. detalle_pedidos — fragmento derivado B ────────────────
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+lab_bdd tmp_detalle_frag_B | \
+sed 's/`tmp_detalle_frag_B`/`detalle_pedidos`/g' | \
+sudo mariadb lab_bdd
+echo ">>> detalle_pedidos frag_B importado."
+sudo mariadb lab_bdd -e "SELECT COUNT(*) AS detalles_cargados
+FROM detalle_pedidos;"
+28
+
+Bash
+# ── 4. Productos — catálogo COMPLETO ─────────────────────────
+mysqldump \
+-h 192.168.56.101 \
+-u shard_pull \
+-p'ShardPull_2025!' \
+--no-create-info \
+--skip-triggers \
+lab_bdd productos | \
+sudo mariadb lab_bdd
+echo ">>> Productos importados."
+Bash
+# ── 5. Resumen de carga en nodo05 ────────────────────────────
+sudo mariadb lab_bdd -e "
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos;"
+Resultado esperado en nodo05 (espejo de nodo04 pero con datos de frag_B):
+Text
++-----------------+-------+
+| tabla | filas |
++-----------------+-------+
+| clientes | 10 | ← frag_B: sur+oeste únicamente
+| productos | 10 | ← catálogo completo (temporal)
+| pedidos | 10 | ← frag_B: sur+oeste únicamente
+| detalle_pedidos | 18 | ← aprox.; co-localizado con pedidos_frag_B
++-----------------+-------+
+29
+
+D.10 Verificar correctitud de fragmentación en los shards
+Ejecutar el siguiente bloque en nodo04. Para nodo05, cambiar los valores del
+CASE de 'norte','este' por 'sur','oeste' (y el mensaje de texto, si se desea).
+(VM — nodo04):
+30
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ============================================================
+-- VERIFICACIÓN 1: DISJUNCIÓN
+-- Las regiones presentes deben ser SOLO las del fragmento asignado.
+-- En nodo04 deben aparecer únicamente 'norte' y 'este'.
+-- ============================================================
+SELECT 'Disjunción — clientes' AS verificacion,
+GROUP_CONCAT(DISTINCT region
+ORDER BY region) AS regiones_presentes,
+CASE
+WHEN GROUP_CONCAT(DISTINCT region ORDER BY region)
+IN ('este,norte', 'norte,este')
+THEN 'OK — solo frag_A (norte+este)'
+ELSE 'FALLA — hay regiones que no pertenecen a este shard'
+END AS resultado
+FROM clientes;
+-- Buscar explícitamente filas de frag_B que no deberían estar aquí
+SELECT 'Filas de frag_B en nodo04' AS verificacion,
+COUNT(*) AS filas_invalidas,
+CASE WHEN COUNT(*) = 0 THEN 'OK'
+ELSE 'FALLA' END AS resultado
+FROM clientes
+WHERE region IN ('sur', 'oeste');
+-- Lo mismo para pedidos
+SELECT 'Disjunción — pedidos' AS verificacion,
+GROUP_CONCAT(DISTINCT region
+ORDER BY region) AS regiones_presentes,
+CASE
+WHEN GROUP_CONCAT(DISTINCT region ORDER BY region)
+IN ('este,norte', 'norte,este')
+THEN 'OK — solo frag_A'
+ELSE 'FALLA'
+END AS resultado
+FROM pedidos;
+-- ============================================================
+-- VERIFICACIÓN 2: CO-LOCALIZACIÓN detalle_pedidos ↔ pedidos
+-- Todos los pedidos referenciados en detalle_pedidos deben
+-- tener su fila padre en la tabla pedidos de este mismo nodo.
+-- ============================================================
+SELECT 'Co-localización detalle↔pedidos' AS verificacion,
+COUNT(*) AS detalles_sin_pedido_local,
+CASE
+WHEN COUNT(*) = 0
+31
+
+THEN 'OK — co-localización correcta'
+ELSE 'FALLA — línea de detalle huérfana detectada'
+END AS resultado
+FROM detalle_pedidos dp
+WHERE NOT EXISTS (
+SELECT 1 FROM pedidos p WHERE p.id = dp.pedido_id
+);
+-- ============================================================
+-- VERIFICACIÓN 3: INTEGRIDAD CLIENTE-PEDIDO
+-- Verificar que la co-localización preserva la integridad:
+-- el cliente de cada pedido debe existir en este mismo shard.
+-- (No hay FK de motor, pero el diseño lo garantiza por predicado.)
+-- ============================================================
+SELECT 'Integridad cliente↔pedido' AS verificacion,
+COUNT(*) AS pedidos_sin_cliente_local,
+CASE
+WHEN COUNT(*) = 0
+THEN 'OK — integridad preservada por co-localización'
+ELSE 'ADVERTENCIA — revisar predicado de fragmentación'
+END AS resultado
+FROM pedidos p
+WHERE NOT EXISTS (
+SELECT 1 FROM clientes c WHERE c.id = p.cliente_id
+);
+-- ============================================================
+-- VERIFICACIÓN 4: JOIN LOCAL COMPLETO
+-- El JOIN de las tres tablas debe resolverse sin datos externos.
+-- Resultado: solo filas de regiones norte y este.
+-- ============================================================
+SELECT c.region,
+CONCAT(c.nombre, ' ', c.apellido) AS cliente,
+p.id AS pedido_id,
+p.estado,
+COUNT(dp.id) AS lineas_detalle,
+ROUND(SUM(dp.subtotal), 2) AS total_calculado,
+p.total AS total_registrado
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+GROUP BY c.region, c.id, p.id
+ORDER BY c.region, p.id;
+EOF
+32
+
+En nodo05, ejecutar el mismo bloque ajustando los textos del CASE:
+cambiar IN ('sur','oeste') como valores válidos y IN ('norte','este')
+como inválidos. El resultado esperado debe mostrar solo regiones sur y oeste .
+D.11 Verificar la reconstrucción global desde nodo01
+(VM — nodo01):
+33
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ============================================================
+-- VERIFICACIÓN DE COMPLETITUD — TRES CONDICIONES FORMALES
+-- Se simula en nodo01 la reconstrucción que en la Fase 14
+-- realizará el coordinador (nodo06) con el motor Spider.
+-- ============================================================
+-- --- CLIENTES ---
+SELECT 'Completitud clientes' AS condicion,
+(SELECT COUNT(*) FROM clientes) AS total_global,
+(SELECT COUNT(*) FROM clientes WHERE region IN ('norte','este')) +
+(SELECT COUNT(*) FROM clientes WHERE region IN ('sur','oeste'))
+AS suma_fragmentos,
+CASE
+WHEN (SELECT COUNT(*) FROM clientes) =
+(SELECT COUNT(*) FROM clientes WHERE region IN
+('norte','este')) +
+(SELECT COUNT(*) FROM clientes WHERE region IN ('sur','oeste'))
+THEN 'OK'
+ELSE 'FALLA'
+END AS resultado
+UNION ALL
+SELECT 'Disjunción clientes',
+0,
+(SELECT COUNT(*) FROM clientes
+WHERE region IN ('norte','este') AND region IN ('sur','oeste')),
+CASE
+WHEN (SELECT COUNT(*) FROM clientes
+WHERE region IN ('norte','este')
+AND region IN ('sur','oeste')) = 0
+THEN 'OK'
+ELSE 'FALLA'
+END
+UNION ALL
+-- --- PEDIDOS ---
+SELECT 'Completitud pedidos',
+(SELECT COUNT(*) FROM pedidos),
+(SELECT COUNT(*) FROM pedidos WHERE region IN ('norte','este')) +
+(SELECT COUNT(*) FROM pedidos WHERE region IN ('sur','oeste')),
+CASE
+WHEN (SELECT COUNT(*) FROM pedidos) =
+(SELECT COUNT(*) FROM pedidos WHERE region IN
+('norte','este')) +
+(SELECT COUNT(*) FROM pedidos WHERE region IN ('sur','oeste'))
+34
+
+THEN 'OK' ELSE 'FALLA'
+END
+UNION ALL
+-- --- DETALLE_PEDIDOS (fragmentación derivada) ---
+SELECT 'Completitud detalle_pedidos',
+(SELECT COUNT(*) FROM detalle_pedidos),
+(SELECT COUNT(*) FROM tmp_detalle_frag_A) +
+(SELECT COUNT(*) FROM tmp_detalle_frag_B),
+CASE
+WHEN (SELECT COUNT(*) FROM detalle_pedidos) =
+(SELECT COUNT(*) FROM tmp_detalle_frag_A) +
+(SELECT COUNT(*) FROM tmp_detalle_frag_B)
+THEN 'OK' ELSE 'FALLA'
+END;
+EOF
+35
+
+Bash
+# ── Consulta UNION ALL de reconstrucción (anticipación de la Fase 14) ──
+# Esta es la consulta exacta que el coordinador ejecutará via Spider.
+# Por ahora se valida en nodo01 sobre sus propios datos.
+sudo mariadb lab_bdd << 'EOF'
+-- Reconstrucción de clientes: UNION ALL de frag_A + frag_B
+SELECT COUNT(*) AS clientes_reconstruidos
+FROM (
+SELECT id, nombre, apellido, region FROM clientes
+WHERE region IN ('norte','este') -- subconsulta → nodo04 en Fase 14
+UNION ALL
+SELECT id, nombre, apellido, region FROM clientes
+WHERE region IN ('sur','oeste') -- subconsulta → nodo05 en Fase 14
+) AS t_reconstruido;
+-- Debe devolver 20: igual al total de la tabla original
+-- Resumen de distribución por región
+SELECT region,
+COUNT(*) AS clientes,
+CASE
+WHEN region IN ('norte','este') THEN 'nodo04 (frag_A)'
+ELSE 'nodo05 (frag_B)'
+END AS shard_destino
+FROM clientes
+GROUP BY region
+ORDER BY region;
+EOF
+36
+
+Bash
+# ── Verificación cruzada de conteos consultando los shards remotamente ──
+# nodo01 conecta a nodo04 y nodo05 usando shard_verify
+echo "=== nodo04 (frag_A) ==="
+mysql -h 192.168.56.104 \
+-u shard_verify \
+-p'ShardVerify_2025!' \
+lab_bdd \
+-e "SELECT 'clientes' AS t, COUNT(*) AS n FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM
+productos;" 2>/dev/null
+echo ""
+echo "=== nodo05 (frag_B) ==="
+mysql -h 192.168.56.105 \
+-u shard_verify \
+-p'ShardVerify_2025!' \
+lab_bdd \
+-e "SELECT 'clientes' AS t, COUNT(*) AS n FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM
+productos;" 2>/dev/null
+echo ""
+echo "=== nodo01 (global — referencia) ==="
+sudo mariadb lab_bdd \
+-e "SELECT 'clientes' AS t, COUNT(*) AS n FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos;"
+Resultado esperado (los detalles pueden ser 17–19 según los datos de la Fase 8):
+37
+
+Text
+nodo04 clientes=10 pedidos=10 detalle~18 productos=10
+nodo05 clientes=10 pedidos=10 detalle~18 productos=10
+nodo01 clientes=20 pedidos=20 detalle=36 productos=10
+nodo04 + nodo05 = nodo01 → Completitud verificada ✓
+D.12 Limpieza en nodo01 (VM — nodo01)
+Bash
+sudo mariadb << 'EOF'
+-- Eliminar tablas temporales (los datos ya están cargados en los shards)
+DROP TABLE IF EXISTS lab_bdd.tmp_detalle_frag_A;
+DROP TABLE IF EXISTS lab_bdd.tmp_detalle_frag_B;
+-- Eliminar usuarios de transferencia (principio de mínimo privilegio:
+-- una vez completada la carga, el acceso ya no es necesario)
+DROP USER IF EXISTS 'shard_pull'@'192.168.56.104';
+DROP USER IF EXISTS 'shard_pull'@'192.168.56.105';
+FLUSH PRIVILEGES;
+-- Confirmar que lab_bdd conserva únicamente sus tablas originales
+SHOW TABLES IN lab_bdd;
+-- Confirmar que los datos originales siguen intactos
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM lab_bdd.clientes
+UNION ALL
+SELECT 'productos', COUNT(*) FROM lab_bdd.productos
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM lab_bdd.pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*)
+FROM lab_bdd.detalle_pedidos;
+EOF
+Salida esperada:
+• SHOW TABLES devuelve las cuatro tablas originales sin tmp_detalle_frag_* 
+• Los conteos son  /  /  /  idénticos al estado post-Fase 
+38
+
+Los DROP TABLE y DROP USER de este paso se propagan automáticamente a
+bdd-nodo02 y bdd-nodo03 vía replicación física y lógica, respectivamente.
+Los esclavos eliminan las tablas temporales que recibieron cuando se crearon,
+quedando con lab_bdd en su estado limpio original. Comportamiento correcto y
+esperado.
+D.13 Apagar los nodos y tomar los snapshots fase13-completa (host)
+Bash
+# En la sesión SSH de nodo01:
+sudo poweroff
+Bash
+# En la sesión SSH de nodo04:
+sudo poweroff
+Bash
+# En la sesión SSH de nodo05:
+sudo poweroff
+Confirmar desde el host que las VMs están detenidas:
+PowerShell
+VBoxManage list runningvms
+# Salida esperada: vacía
+Tomar el snapshot en los cinco nodos del laboratorio:
+39
+
+PowerShell
+VBoxManage snapshot "bdd-nodo01" take "fase13-completa" `
+--description "MAESTRO: lab_bdd intacto (20/10/20/36). tmp_detalle
+eliminadas. shard_pull eliminado. Fragmentación horizontal distribuida a
+nodo04/05 verificada."
+VBoxManage snapshot "bdd-nodo02" take "fase13-completa" `
+--description "ESCLAVO: lab_bdd igual que nodo01 post-limpieza. Sin cambios
+funcionales en esta fase."
+VBoxManage snapshot "bdd-nodo03" take "fase13-completa" `
+--description "MULTI-MAESTRO: lab_bdd igual que nodo01 post-limpieza. Sin
+cambios funcionales en esta fase."
+VBoxManage snapshot "bdd-nodo04" take "fase13-completa" `
+--description "SHARD-A: lab_bdd con frag_A (norte+este). clientes=10,
+pedidos=10, detalle~18, productos=10. server_id=4. IP=192.168.56.104. Sin FK."
+VBoxManage snapshot "bdd-nodo05" take "fase13-completa" `
+--description "SHARD-B: lab_bdd con frag_B (sur+oeste). clientes=10,
+pedidos=10, detalle~18, productos=10. server_id=5. IP=192.168.56.105. Sin FK."
+Verificar la lista de snapshots:
+PowerShell
+VBoxManage snapshot "bdd-nodo01" list
+VBoxManage snapshot "bdd-nodo02" list
+VBoxManage snapshot "bdd-nodo03" list
+VBoxManage snapshot "bdd-nodo04" list
+VBoxManage snapshot "bdd-nodo05" list
+bdd-nodo01 y bdd-nodo02 deben mostrar siete snapshots ( fase05-completa
+hasta fase13-completa ). bdd-nodo03 debe mostrar desde fase11-completa
+hasta fase13-completa . bdd-nodo04 y bdd-nodo05 muestran únicamente su
+snapshot inicial fase13-completa .
+E. Verificación de funcionamiento
+Esta fase se considera completa cuando se cumplen todos los puntos siguientes:
+ VBoxManage showvminfo "bdd-nodo04" y "bdd-nodo05" confirman que las VMs
+están registradas con las descripciones de rol de shard y en estado powered off 
+40
+
+ hostnamectl status devuelve bdd-nodo04 en nodo y bdd-nodo05 en nodo
+ ip addr show | grep 192.168 muestra 192.168.56.104/24 en nodo y
+192.168.56.105/24 en nodo
+ SHOW VARIABLES LIKE 'server_id' devuelve 4 en nodo y 5 en nodo
+ SHOW VARIABLES LIKE 'log_bin' devuelve OFF en nodo y nodo
+ SHOW VARIABLES LIKE 'bind_address' devuelve 0.0.0.0 en nodo y nodo
+ SHOW TABLES IN lab_bdd en nodo y nodo devuelve exactamente cuatro
+tablas clientes  detalle_pedidos  pedidos  productos 
+ SHOW CREATE TABLE pedidos y SHOW CREATE TABLE detalle_pedidos en ambos
+shards no contienen ninguna cláusula FOREIGN KEY ni CONSTRAINT … FOREIGN 
+ SELECT COUNT(*) FROM clientes en nodo devuelve exactamente 10 filas
+ SELECT DISTINCT region FROM clientes en nodo muestra solo norte y
+este — ningún valor de frag_B
+ SELECT COUNT(*) FROM clientes en nodo devuelve exactamente 10 filas
+ SELECT DISTINCT region FROM clientes en nodo muestra solo sur y
+oeste — ningún valor de frag_A
+ SELECT COUNT(*) FROM pedidos devuelve 10 en nodo y 10 en nodo
+ La suma COUNT(detalle_pedidos nodo04) + COUNT(detalle_pedidos nodo05) es
+igual al total de detalle_pedidos en nodo ( filas)
+ SELECT COUNT(*) FROM productos devuelve 10 en nodo y 10 en nodo
+(catálogo completo en ambos)
+ La verificación de disjunción SELECT COUNT(*) FROM clientes WHERE region
+IN ('sur','oeste') en nodo devuelve 0  lo mismo para ('norte','este')
+en nodo
+ La verificación de co-localización SELECT COUNT(*) FROM detalle_pedidos dp
+WHERE NOT EXISTS (SELECT 1 FROM pedidos p WHERE p.id = dp.pedido_id) devuelve
+0 en ambos shards
+ La verificación de integridad cliente-pedido SELECT COUNT(*) FROM pedidos p
+WHERE NOT EXISTS (SELECT 1 FROM clientes c WHERE c.id = p.cliente_id)
+devuelve 0 en ambos shards
+ El JOIN local completo (D) en nodo produce únicamente filas con regiones
+norte y este  en nodo únicamente sur y oeste 
+ Las verificaciones de completitud en nodo (D) devuelven OK para las
+tres condiciones y las tres tablas fragmentadas
+ SHOW TABLES IN lab_bdd en nodo no muestra tmp_detalle_frag_A ni
+tmp_detalle_frag_B 
+41
+
+ SHOW GRANTS FOR 'shard_pull'@'192.168.56.104' en nodo devuelve error
+o resultado vacío (usuario eliminado en D)
+ Los snapshots fase13-completa existen en los cinco nodos del laboratorio
+ El estudiante puede explicar de memoria la diferencia entre fragmentación
+primaria ( clientes  pedidos ) y derivada ( detalle_pedidos ) y por qué
+productos se carga completo temporalmente en ambos shards
+42
+
+F. Problemas comunes y soluciones
+| Problema         | Causa probable   | Solución       |     |
+| ---------------- | ---------------- | -------------- | --- |
+| SSH a  para  | nodo sigue     | Apagar nodo  |     |
+| configurar       | corriendo con    | completamente  |     |
+| nodo conecta   |  al mismo    | antes de       |     |
+| al nodo          | tiempo que el    | arrancar       |     |
+| equivocado o da  | clon generando  | nodo (D)  |     |
+| Connection       | conflicto ARP    | verificar con  |     |
+| refused          |                  | VBoxManage     |     |
+list
+|     |     | runningvms |     |
+| --- | --- | ---------- | --- |
+antes de D
+| VBoxManage       | El nombre del  | Ejecutar       |     |
+| ---------------- | -------------- | -------------- | --- |
+| clonevm  falla   | snapshot no    | VBoxManage     |     |
+| con “Could not   | coincide       | snapshot "bdd- |     |
+| find a snapshot  | exactamente    | nodo01" list   |     |
+| named ‘fase-   | (espacios     | para ver el    |     |
+mayúsculas
+| completa’“ |     | nombre exacto  |     |
+| ---------- | --- | --------------- | --- |
+acentos)
+copiarlo
+literalmente en
+el comando
+| netplan apply  |   Edición manual  | Usar            |       |
+| -------------- | ----------------- | --------------- | ----- |
+| produce error  | incorrecta del    | exactamente el  |       |
+| de sintaxis    | archivo  .yaml    |   comando       | sed - |
+| YAML           | (indentación      | i               |       |
+|                | YAML es           | 's/192\.168\.5  |       |
+|                | sensible)         | 6\.101/192.168  |       |
+|                |                   | .56.104/g'      |  en   |
+lugar de editar
+manualmente
+validar con
+sudo netplan
+|     |     | try  antes de  |     |
+| --- | --- | -------------- | --- |
+aplicar
+| La sesión SSH     | El cambio de IP  | Usar la consola  |     |
+| ----------------- | ---------------- | ---------------- | --- |
+| se pierde         | se aplicó pero   | VirtualBox       |     |
+| durante           | hay un error de  | (botón “Show”    |     |
+| netplan apply     |   red adicional  | en VirtualBox    |     |
+| y la nueva IP no  | (gateway        | Manager) para    |     |
+| responde          | interfaz)        | iniciar sesión   |     |
+directamente
+|     |     | ejecutar  | ip  |
+| --- | --- | --------- | --- |
+43
+
+|     |     |     |     | addr show |  y  |
+| --- | --- | --- | --- | --------- | --- |
+cat
+/etc/netplan/*
+.yaml  para
+diagnosticar
+| mysqldump |     | bind-address |     | Verificar en  |     |
+| --------- | --- | ------------ | --- | ------------- | --- |
+nodo:
+| produce      | ERROR  | sigue siendo   |      | grep           |     |
+| ------------ | ------ | -------------- | ---- | -------------- | --- |
+| 2003: Can't  |        | 127.0.0.1      |  en  | bind-address   |     |
+| connect to   |        | nodo (no se  |      | /etc/mysql/mar |     |
+cambió en Fase
+| MySQL server  |     |     |     | iadb.conf.d/50 |     |
+| ------------- | --- | --- | --- | -------------- | --- |
+) o el usuario
+| on  |     |     |     | -server.cnf |  si  |
+| --- | --- | --- | --- | ----------- | ----- |
+ no
+| '192.168.56.10 |     | shard_pull |     | sigue en  |     |
+| -------------- | --- | ---------- | --- | --------- | --- |
+existe
+| 1'  |     |     |     |    |     |
+| --- | --- | --- | --- | ------------ | --- |
+|     |     |     |     | ejecutar el  |     |
+sed
+del D de la
+Fase  y
+reiniciar
+MariaDB
+| mysqldump      |     | El usuario fue    |     | En nodo:   |     |
+| -------------- | --- | ----------------- | --- | ------------ | --- |
+| devuelve       |     | creado con host   |     | SHOW GRANTS  |     |
+| Access denied  |     | incorrecto o sin  |     | FOR          |     |
+el GRANT
+| for user  |     |     |     | 'shard_pull'@' |     |
+| --------- | --- | --- | --- | -------------- | --- |
+correspondiente
+| 'shard_pull'@' |     |     |     | 192.168.56.104 |     |
+| -------------- | --- | --- | --- | -------------- | --- |
+| 192.168.56.104 |     |     |     | '  si falta  |     |
+| '              |     |     |     | GRANT SELECT   |     |
+ON lab_bdd.*
+TO
+'shard_pull'@'
+192.168.56.104
+'; FLUSH
+PRIVILEGES;
+| El  sed  del paso  |     | Las comillas     |     | Probar primero  |        |
+| ------------------ | --- | ---------------- | --- | --------------- | ------ |
+| de                 |     | invertidas o el  |     | solo el         |        |
+|                    |     | patrón del       |     |                 |        |
+| tmp_detalle_fr     |     |                  | sed | mysqldump |     |        |
+| ag_A  no           |     | no coinciden     |     | head -30        |  para  |
+con la salida real
+| reemplaza el  |     |           |     | ver el formato  |     |
+| ------------- | --- | --------- | --- | --------------- | --- |
+|               |     | de        |     | exacto de los   |     |
+| nombre y los  |     | mysqldump |     |                 |     |
+INSERT ajustar
+INSERT fallan
+| con “Table     |     |     |     | el patrón del  |     |
+| -------------- | --- | --- | --- | -------------- | --- |
+| doesn’t exist” |     |     |     | sed  si el     |     |
+nombre de tabla
+aparece entre
+44
+
+comillas simples
+en lugar de
+invertidas
+| SHOW CREATE   | Se usó             | Ejecutar  DROP  |
+| ------------- | ------------------ | --------------- |
+|               |   mysqldump  para  |                 |
+| TABLE pedidos |                    | TABLE pedidos;  |
+| en el shard   | importar el        |                 |
+DROP TABLE
+| muestra  | esquema en  |     |
+| -------- | ----------- | --- |
+detalle_pedido
+| FOREIGN KEY | lugar del DDL  |  en el shard  |
+| ----------- | -------------- | ------------- |
+s;
+|     | explícito de D | afectado volver  |
+| --- | ---------------- | ----------------- |
+a crear con el
+DDL de D (sin
+FK) y reimportar
+los datos
+| La verificación  | Se cargó  |     |
+| ---------------- | --------- | --- |
+TRUNCATE TABLE
+de co-
+|                   | tmp_detalle_fr   | detalle_pedido |
+| ----------------- | ---------------- | -------------- |
+| localización      |  en              |                |
+|                   | ag_B             | s;  en nodo  |
+| devuelve filas >  | nodo en lugar  |                |
+y repetir el paso
+|  en nodo | de  |     |
+| ----------- | --- | --- |
+D bloque 
+|     | tmp_detalle_fr | con la tabla  |
+| --- | -------------- | ------------- |
+|     |  (error en     | correcta      |
+ag_A
+|     | el sed o en la   | ( tmp_detalle_f |
+| --- | ---------------- | --------------- |
+|     | selección de la  | rag_A )         |
+tabla)
+| La suma de  | Las tablas  | En nodo:  |
+| ----------- | ----------- | ----------- |
+temporales en
+| detalle_pedido |            | SELECT         |
+| -------------- | ---------- | -------------- |
+|  en nodo +   | nodo no  |                |
+| s              |            | COUNT(*) FROM  |
+materializaron
+| nodo no  |                | tmp_detalle_fr |
+| ---------- | -------------- | -------------- |
+| suma     | correctamente  |                |
+ag_A; SELECT
+todos los
+COUNT(*) FROM
+pedidos
+tmp_detalle_fr
+ag_B;  — la
+suma debe ser
+ si no
+ejecutar  DROP
+TABLE IF
+EXISTS
+tmp_detalle_fr
+ag_A; CREATE
+TABLE...  con
+el JOIN
+corregido (D
+paso )
+45
+
+| VBoxManage    | La VM está    | Confirmar con  |     |
+| ------------- | ------------- | -------------- | --- |
+| snapshot ...  | encendida al  | VBoxManage     |     |
+momento de
+| take  falla con  |     | list  |     |
+| ---------------- | --- | ----- | --- |
+tomar el
+| “Cannot take a  |     | runningvms |     |
+| --------------- | --- | ---------- | --- |
+snapshot
+| snapshot of the   |     | que está vacío  |     |
+| ----------------- | --- | ---------------- | --- |
+| machine while it  |     | si la VM         |     |
+| is running”       |     | aparece apagar  |     |
+con
+VBoxManage
+controlvm
+"bdd-nodo04"
+acpipowerbutto
+|                     |                 | n  y esperar    |       |
+| ------------------- | --------------- | --------------- | ----- |
+| nodo o            | El esclavo      | En nodo:      |       |
+| nodo              | recibió el      | SHOW SLAVE      |       |
+| muestran error      | CREATE TABLE    |   STATUS\G      |  si  |
+| en el hilo SQL al   | pero aplicó el  | Last_SQL_Erro   |       |
+| reiniciar (por las  | DROP TABLE      |   r  menciona   |       |
+| tablas              | antes de        | “Table doesn’t  |       |
+| tmp_detalle_fr      | terminar de     | exist” en el    |       |
+| ag_* )              | procesar        | DROP:           | SET   |
+|                     | eventos         | GLOBAL          |       |
+intermedios
+SQL_SLAVE_SKIP
+_COUNTER = 1;
+
+START SLAVE;
+— el estado final
+(sin tablas tmp)
+es el correcto
+| mysql -h  | El usuario  | En nodo:  |     |
+| --------- | ----------- | ----------- | --- |
+
+| 192.168.56.104  | shard_verify | GRANT SELECT  |     |
+| --------------- | ------------ | ------------- | --- |
+se creó en D
+| -u  |     | ON lab_bdd.*  |     |
+| --- | --- | ------------- | --- |
+pero el GRANT
+| shard_verify |     | TO  |     |
+| ------------ | --- | --- | --- |
+sobre
+| desde nodo  |           | 'shard_verify' |     |
+| ------------- | --------- | -------------- | --- |
+|               | lab_bdd.* |  no            |     |
+| da  Access    |           | @'192.168.56.1 |     |
+se otorgó en D
+| denied |     | 01'; FLUSH  |     |
+| ------ | --- | ----------- | --- |
+PRIVILEGES;
+G. Checklist de validación
+ y   confirman las VMs
+| VBoxManage showvminfo "bdd-nodo04" |     |     | "bdd-nodo05" |
+| ---------------------------------- | --- | --- | ------------ |
+como clones enlazados registrados con la descripción de rol de shard.
+hostnamectl status  devuelve  bdd-nodo04  en nodo04 y  bdd-nodo05  en nodo05.
+46
+
+| ip addr show |     |  muestra  | .104  en nodo04 y  |     | .105  en nodo05. |     |     |
+| ------------ | --- | --------- | ------------------ | --- | ---------------- | --- | --- |
+SHOW VARIABLES LIKE 'server_id'  devuelve  4  en nodo04 y  5  en nodo05.
+|                                    |     |     |     |  devuelve  |  en ambos shards. |         |                   |
+| ---------------------------------- | --- | --- | --- | ---------- | ----------------- | ------- | ----------------- |
+| SHOW VARIABLES LIKE 'log_bin'      |     |     |     |            | OFF               |         |                   |
+|                                    |     |     |     |  devuelve  |                   |         |  en ambos shards. |
+| SHOW VARIABLES LIKE 'bind_address' |     |     |     |            |                   | 0.0.0.0 |                   |
+ en ambos shards devuelve exactamente cuatro tablas
+SHOW TABLES IN lab_bdd
+| ( clientes | ,   | detalle_pedidos | ,   | pedidos | ,  productos | ).  |     |
+| ---------- | --- | --------------- | --- | ------- | ------------ | --- | --- |
+SHOW CREATE TABLE pedidos  y  SHOW CREATE TABLE detalle_pedidos  en ambos
+| shards no contienen  |     | FOREIGN KEY |     | .   |     |     |     |
+| -------------------- | --- | ----------- | --- | --- | --- | --- | --- |
+SELECT COUNT(*) FROM clientes  devuelve  10  en nodo04 y  10  en nodo05.
+SELECT DISTINCT region FROM clientes  en nodo04 muestra únicamente  norte
+| y  este | ; en nodo05 únicamente  |     |     | sur  y  oeste | .   |     |     |
+| ------- | ----------------------- | --- | --- | ------------- | --- | --- | --- |
+SELECT COUNT(*) FROM pedidos  devuelve  10  en nodo04 y  10  en nodo05.
+SELECT DISTINCT region FROM pedidos  en nodo04 muestra  norte  y  este ;
+| en nodo05 muestra  |     | sur |  y  oeste | .   |     |     |     |
+| ------------------ | --- | --- | --------- | --- | --- | --- | --- |
+COUNT(detalle_pedidos nodo04) + COUNT(detalle_pedidos nodo05) = 36 .
+SELECT COUNT(*) FROM productos  devuelve  10  en nodo04 y  10  en nodo05.
+Verificación de disjunción:  COUNT(*) FROM clientes WHERE region IN
+ = 0 en nodo04;
+|   ('sur','oeste')  |     |                 |     | COUNT(*) FROM clientes WHERE region IN |     |     |     |
+| ------------------ | --- | --------------- | --- | -------------------------------------- | --- | --- | --- |
+|   ('norte','este') |     |  = 0 en nodo05. |     |                                        |     |     |     |
+Verificación de co-localización:  COUNT(*) FROM detalle_pedidos dp WHERE
+ = 0 en
+  NOT EXISTS (SELECT 1 FROM pedidos p WHERE p.id = dp.pedido_id)
+ambos shards.
+Verificación de integridad cliente-pedido:  COUNT(*) FROM pedidos p WHERE
+  NOT EXISTS (SELECT 1 FROM clientes c WHERE c.id = p.cliente_id)  = 0 en
+ambos shards.
+El JOIN local completo (D.10) en nodo04 devuelve solo regiones  norte / este ;
+| en nodo05 solo  |     | sur / oeste | .   |     |     |     |     |
+| --------------- | --- | ----------- | --- | --- | --- | --- | --- |
+Las tres verificaciones de completitud en nodo01 (D.11) devuelven  OK .
+SHOW TABLES IN lab_bdd  en nodo01 no incluye  tmp_detalle_frag_A  ni
+| tmp_detalle_frag_B |     | .   |     |     |     |     |     |
+| ------------------ | --- | --- | --- | --- | --- | --- | --- |
+SHOW GRANTS FOR 'shard_pull'@'192.168.56.104'  en nodo01 devuelve error
+o vacío (usuario eliminado).
+Los snapshots  fase13-completa  existen en los cinco nodos del laboratorio.
+Puedo explicar sin ver el documento la diferencia entre fragmentación
+| primaria ( | clientes | ,  pedidos | ) y derivada ( |     | detalle_pedidos |     | ).  |
+| ---------- | -------- | ---------- | -------------- | --- | --------------- | --- | --- |
+47
+
+Puedo justificar por qué no hay FK en los shards y cómo la co-localización
+preserva la integridad referencial por diseño.
+Puedo describir qué hará el coordinador nodo06 en la Fase 14 para ejecutar
+la consulta UNION ALL de forma transparente al cliente.
+Preguntas teóricas para estudiantes
+ En la verificación de integridad cliente-pedido (D) se confirma que en
+nodo todos los pedidos tienen su cliente en el mismo nodo y lo mismo en
+nodo Esto ocurre por diseño ambas tablas se fragmentan con el mismo
+predicado ( region ) Describe un escenario de negocio realista en que esta
+garantía podría romperse — es decir en que el cliente de un pedido estuviera
+en un shard diferente al pedido — y explica qué cambio en el proceso de
+inserción causaría esa situación ¿Cómo detectaría el sistema ese problema
+sin una FK de motor?
+ La tabla productos se cargó completa en nodo y en nodo lo que
+implica que los  productos están almacenados dos veces en el sistema
+distribuido Analiza el impacto de esta replicación temporal en (a) el
+espacio de almacenamiento (b) la consistencia cuando se actualiza el precio
+de un producto en nodo (¿se propaga automáticamente a nodo y nodo?) y
+© las consultas SELECT sobre productos desde los shards ¿Qué problema
+concreto resuelve la fragmentación vertical de la Fase  comparada con este
+estado actual?
+ La fragmentación derivada de detalle_pedidos se implementó mediante tablas
+temporales en nodo porque detalle_pedidos no tiene columna region 
+Proponer un diseño de esquema alternativo que agregue la columna region
+directamente a detalle_pedidos como columna derivada (desnormalización) y
+evaluar (a) ventajas e inconvenientes de la desnormalización (b) mecanismo
+para mantener detalle_pedidos.region consistente con pedidos.region sin
+FK cross-nodo y © impacto en el tamaño de datos almacenados por shard
+ Los shards tienen log_bin = OFF en su configuración Explica las implicaciones
+de esta decisión en los siguientes escenarios (a) recuperación ante fallo
+total de nodo (b) posibilidad de agregar un esclavo de lectura a nodo en
+fases futuras y © auditoría de cambios en los datos del shard ¿En qué
+circunstancia del laboratorio sería conveniente habilitar el binary log en los
+shards?
+48
+
+ Un estudiante propone usar el snapshot fase12-completa (el más reciente) en
+lugar de fase08-completa como base para los clones argumentando que incluye
+más configuraciones Evalúa técnicamente esa propuesta ¿qué configuraciones
+habría que eliminar o neutralizar en el clon? ¿qué riesgo concreto existe si
+el archivo 60-replication-master.cnf no se elimina del shard? y ¿por qué
+fase08-completa es la base más limpia para un nodo shard autónomo?
+Ejercicios prácticos
+ Script de auditoría de integridad referencial distribuida
+Escribir un script Bash en nodo que conectándose a nodo y a nodo vía
+mysql -h ... -u shard_verify  detecte automáticamente (a) filas en
+detalle_pedidos de cada shard que no tienen su pedido_id en la tabla
+pedidos del mismo shard y (b) filas en pedidos de cada shard que no
+tienen su cliente_id en clientes  El script debe imprimir [NODO04] OK
+o [NODO04] FALLA: N huérfanos en detalle_pedidos según el resultado
+Insertar deliberadamente una fila huérfana en nodo confirmar que el script
+la detecta eliminarla y corroborar que vuelve a OK 
+ Análisis del diseño alternativo con cuatro shards
+Si el laboratorio creciera a cuatro nodos de sharding (nodo a nodo) el
+diseño natural sería un shard por región ( norte  sur  este  oeste )
+Documentar los predicados WHERE para esa fragmentación de cuatro fragmentos
+calcular el número de filas esperadas por shard para clientes  pedidos y
+detalle_pedidos  y analizar si el diseño de  shards ofrece ventajas sobre
+el de  en términos de balanceo de carga granularidad de poda en JOINs y
+coste de agregar una quinta región No es necesario implementarlo
+ Reconstrucción con el motor FEDERATEDX
+Desde nodo habilitar el motor FederatedX con INSTALL SONAME
+'ha_federatedx';  Crear una tabla tipo FEDERATED en nodo apuntando a la
+tabla clientes de nodo:
+SQL
+CREATE TABLE clientes_shard_a (...estructura...)
+ENGINE=FEDERATED
+CONNECTION='mysql://shard_verify:ShardVerify_2025!@192.168.56.104/la
+b_bdd/clientes';
+49
+
+Repetir para nodo ( clientes_shard_b ) Ejecutar una UNION ALL real entre
+las dos tablas FEDERATED y comparar el resultado con lab_bdd.clientes en
+nodo Documentar la salida y explicar por qué este enfoque con FEDERATED es
+el precursor conceptual directo de las tablas Spider que se usarán en la Fase 
+Reto adicional para alumnos avanzados
+Diseñar e implementar un procedimiento de resincronización automatizada de
+shards para el escenario en que nodo04 queda temporalmente desconectado de la
+red y, durante ese tiempo, se insertan en nodo01 nuevos pedidos para clientes de
+las regiones norte y este. Al reconectar nodo04, el shard está desactualizado.
+El procedimiento debe: (1) identificar en nodo01 qué filas de clientes ,
+pedidos y detalle_pedidos no están presentes en nodo04, comparando por id
+y por fecha_alta / fecha_pedido ; (2) generar y ejecutar los INSERT
+diferenciales solo para las filas faltantes; (3) verificar que tras la
+sincronización los conteos coincidan y no existan duplicados. Documentar el
+mecanismo completo con comandos exactos y discutir sus limitaciones (¿qué ocurre
+si durante la desconexión se insertaron filas directamente en nodo04 que no están
+en nodo01?). Proponer qué funcionalidad de MariaDB — Galera Cluster, replicación
+semisíncrona u otra — podría automatizar este proceso en producción.
+50
+
+Criterios de evaluación para el profesor
+| Criterio | Peso | Indicador de  |
+| -------- | ---- | ------------- |
+logro
+| Creación y     | % | nodo y        |
+| -------------- | --- | --------------- |
+| configuración  |     | nodo existen  |
+| de los nodos   |     | con la IP      |
+| shard          |     | hostname y      |
+server_id
+correctos
+MariaDB acepta
+conexiones
+remotas las
+claves SSH
+fueron
+regeneradas el
+estudiante
+puede listar los
+snapshots y
+describir la
+estrategia de
+clon enlazado
+| Esquema de    | % | SHOW CREATE  |
+| ------------- | --- | ------------ |
+| shards sin FK |     | TABLE        |
+pedidos/detall
+e_pedidos  en
+ambos shards
+no muestra FK
+el estudiante
+puede explicar
+por qué se
+eliminaron y
+cómo la co-
+localización las
+hace
+innecesarias en
+este diseño
+| Carga de    | % | Los conteos de  |
+| ----------- | --- | --------------- |
+| fragmentos  |     | clientes y      |
+| correcta    |     | pedidos son     |
+exactamente 
+en cada shard
+con las regiones
+correctas la
+51
+
+suma de
+detalles en
+ambos shards
+es 
+productos (
+filas) está en
+ambos shards
+| Verificación de  | % | Las             |     |
+| ---------------- | --- | --------------- | --- |
+| correctitud      |     | verificaciones  |     |
+| (completitud    |     | SQL del bloque  |     |
+| disjunción co-  |     | D producen   |     |
+| localización)    |     | resultados      |     |
+OK
+en ambos
+shards el
+estudiante
+puede ejecutar
+cada
+verificación y
+explicar qué
+mide los JOINs
+locales
+funcionan sin
+acceder a datos
+de otro nodo
+| Reconstrucción  | % | El estudiante  |     |
+| --------------- | --- | -------------- | --- |
+| y demostración  |     | puede mostrar  |     |
+| global          |     | que nodo +   |     |
+nodo =
+nodo para
+cada tabla
+fragmentada
+puede escribir
+de memoria la
+consulta UNION
+ALL que el
+coordinador
+ejecutará en la
+Fase 
+| Comprensión   | % | Las respuestas  |     |
+| ------------- | --- | --------------- | --- |
+| conceptual —  |     | distinguen      |     |
+| preguntas     |     | fragmentación   |     |
+| teóricas      |     | primaria y      |     |
+derivada
+justifican la
+ausencia de FK
+52
+
+con argumentos
+técnicos y
+relacionan el
+diseño con la
+Fase  usando
+términos como
+co-localización
+predicado
+minterm
+completitud y
+transparencia
+I. Preparación para la siguiente fase
+La Fase 14: Fragmentación Vertical requerirá:
+• Los snapshots fase13-completa en los cinco nodos activos del laboratorio
+(completados en esta fase)
+• bdd-nodo04 y bdd-nodo05 configurados como shards autónomos con su carga
+de datos verificada (esta fase)
+• Comprensión del estado actual de productos  está completa y duplicada en
+nodo y nodo — la Fase  la eliminará de ambos y la reemplazará por los
+dos fragmentos verticales definidos en el DDD:
+• V_productos_basico (id sku nombre categoria precio stock
+fecha_creacion) → nodo
+• V_productos_detalle (id sku descripcion ficha_tecnica imagen_url
+peso_kg) → nodo
+• Creación de bdd-nodo06 () al inicio de la Fase : será
+el nodo coordinador que implementa el motor Spider de MariaDB Se creará
+como clon enlazado de bdd-nodo01 desde el snapshot fase08-completa  con
+el mismo proceso de configuración aplicado en esta fase para nodo/
+• Habilitación del motor Spider en nodo con INSTALL SONAME 'ha_spider'; 
+que permite crear tablas tipo SPIDER apuntando a tablas remotas en nodo y
+nodo e implementar la transparencia de fragmentación y ubicación ante el
+cliente
+No es necesario instalar ni configurar nada adicional en los nodos existentes.
+Los shards nodo04 y nodo05 ya tienen el esquema y los datos que la Fase 14
+comenzará a reorganizar.
+53
+
+54
+
+---
+
+# Fase 14 — Fragmentación Vertical
+
+Fase 14 — Fragmentación Vertical
+| Materia | BDD |     |     |
+| ------- | --- | --- | --- |
+Continuación directa de la Fase 13. Los cinco nodos del laboratorio tienen sus snapshots
+ tomados:   es el maestro de replicación física,
+| fase13-completa | bdd-nodo01 |     | bdd-nodo02 |
+| --------------- | ---------- | --- | ---------- |
+su esclavo con  read_only = ON ,  bdd-nodo03  el nodo multi-maestro,  bdd-nodo04
+almacena
+el fragmento horizontal A (regiones norte y este de  clientes ,  pedidos  y
+detalle_pedidos ) y  bdd-nodo05  el fragmento horizontal B (regiones sur y oeste).
+Ambos shards tienen además el catálogo completo de  productos  como tabla temporal
+íntegra.
+En esta fase se realizan dos tareas complementarias: los diez productos se distribuyen
+verticalmente entre nodo04 ( V_productos_basico , columnas operacionales) y nodo05
+| ( , columnas de detalle de gran volumen), y se crea  |     |     |            |
+| ---------------------------------------------------- | --- | --- | ---------- |
+| V_productos_detalle                                  |     |     | bdd-nodo06 |
+como coordinador de consultas distribuidas usando el motor Spider de MariaDB.
+Al finalizar, el cliente puede conectarse a nodo06 y ejecutar consultas globales
+—accediendo
+a datos físicamente distribuidos en nodo04 y nodo05— sin conocer la
+distribución subyacente:
+primera demostración completa de transparencia de fragmentación y transparencia de
+ubicación en el laboratorio.
+A. Objetivos de aprendizaje
+Al finalizar esta fase, el estudiante será capaz de:
+ Crear y poblar los dos fragmentos verticales de  productos  en los nodos de sharding
+aplicando el plan definido en el Documento de Diseño Distribuido (DDD) de la Fase  y
+verificando las tres condiciones de correctitud completitud disjunción de columnas no
+| clave y reconstrucción por  |    |     |     |
+| --------------------------- | --- | --- | --- |
+JOIN
+ Explicar qué es el motor Spider de MariaDB cómo actúa como proxy transparente hacia
+tablas remotas y en qué se diferencia del motor  FEDERATED  (descontinuado)
+ Provisionar  bdd-nodo06  como clon enlazado del snapshot  fase07-completa  de nodo
+| configurar su hostname IP estática  |                |  y            |    |
+| ------------------------------------ | -------------- | ------------- | --- |
+|                                      | 192.168.56.106 | server_id = 6 |     |
+1
+
+ Instalar y habilitar el plugin Spider con INSTALL SONAME 'ha_spider'  verificando que
+el motor queda ACTIVE en information_schema.PLUGINS y que sus tablas de sistema
+mysql.spider_* existen correctamente
+ Registrar los nodos remotos con CREATE SERVER  explicando las ventajas de este enfoque
+frente a incrustar credenciales directamente en el COMMENT de cada tabla Spider
+ Crear tablas Spider particionadas para clientes y pedidos usando
+PARTITION BY LIST COLUMNS (region)  conectando el concepto de poda de particiones
+aprendido en la Fase  con el enrutamiento automático hacia el shard correcto
+ Diseñar y justificar la solución para detalle_pedidos (sin columna region ) usando
+dos tablas Spider simples más una VIEW UNION ALL  explicando por qué no es posible
+usar
+PARTITION BY LIST COLUMNS para esta tabla
+ Crear las tablas Spider para los fragmentos verticales de productos y la VIEW productos
+que los reconstruye por JOIN  logrando transparencia de fragmentación vertical
+ Ejecutar y analizar consultas distribuidas desde nodo que demuestren poda
+de particiones
+(acceso a un solo shard) UNION ALL implícito (ambos shards) y JOIN distribuido entre
+fragmentos verticales
+ Tomar el snapshot fase14-completa en los seis nodos del laboratorio
+B. Conceptos teóricos necesarios
+1. Revisión: fragmentación vertical y condiciones de correctitud.
+La fragmentación vertical divide las columnas de una relación R en proyecciones disjuntas,
+cada una acompañada de la clave primaria:
+Text
+Vᵢ = π(Cᵢ ∪ {PK})(R)
+Las tres condiciones de correctitud verificadas analíticamente en la Fase 9 se trasladan ahora
+a nodos físicos separados:
+2
+
+• Completitud todos los productos deben existir en  V_basico  (nodo) y en
+V_detalle  (nodo) ninguna fila puede perderse en ninguno de los dos fragmentos
+• Disjunción de columnas no clave  {nombre, categoria, precio, stock,
+fecha_creacion}
+∩  {descripcion, ficha_tecnica, imagen_url, peso_kg}  = ∅ La PK ( id ) y la clave
+alternativa ( sku ) se duplican intencionalmente en ambos fragmentos para permitir
+| la reconstrucción mediante  | JOIN |    |
+| --------------------------- | ---- | --- |
+• Reconstrucción  JOIN  por  id  entre los dos fragmentos reproduce la relación
+| productos  completa sin pérdida de atributos |     |     |
+| --------------------------------------------- | --- | --- |
+2. El motor Spider de MariaDB.
+Spider es un motor de almacenamiento nativo de MariaDB —integrado desde la versión 10.0,
+estable desde 10.3— que permite crear tablas cuyos datos residen en uno o varios servidores
+MariaDB o MySQL remotos. Para el cliente, las tablas Spider son indistinguibles de tablas
+InnoDB locales: mismo SQL estándar, mismos tipos de datos, mismas operaciones DML.
+| Característica | FEDERATED  | Spider |
+| -------------- | ---------- | ------ |
+(descontinuado)
+| Particionamient  | No  | Sí (RANGE LIST  |
+| ---------------- | --- | ----------------- |
+| o entre nodos    |     | HASH KEY)        |
+| JOIN distribuido | No  | Sí (coordinador   |
+recombina
+resultados)
+| Transacciones  | No  | Soporte parcial |
+| -------------- | --- | --------------- |
+XA
+| Mantenimiento   | Abandonado | Activo en       |
+| --------------- | ---------- | --------------- |
+| activo          |            | MariaDB x    |
+| Tablas de       | No         | Sí              |
+| sistema propias |            | ( mysql.spider_ |
+)
+*
+Internamente, Spider traduce el SQL del cliente en llamadas TCP al servidor remoto usando el
+protocolo binario de MariaDB. Para un  SELECT  con filtro sobre la columna de
+particionamiento, Spider envía la subconsulta únicamente al shard relevante (poda remota).
+Para un  SELECT  sin filtro, consulta todos los shards y combina los resultados en el
+| coordinador mediante  | .   |     |
+| --------------------- | --- | --- |
+UNION ALL
+3
+
+3. Modos de operación de Spider en este laboratorio.
+| Modo | Descripción | Aplicación en  |     |
+| ---- | ----------- | -------------- | --- |
+Fase 
+| Simple | Una tabla Spider  | v_productos_ba |     |
+| ------ | ----------------- | -------------- | --- |
+|        | apunta a una      | sico           |    |
+sola tabla
+v_productos_de
+remota en
+|     |     | talle |    |
+| --- | --- | ----- | --- |
+un nodo
+spider_detalle
+|     |     | _nodo04 |    |
+| --- | --- | ------- | --- |
+spider_detalle
+_nodo05
+| Horizontal | PARTITION BY    | clientes        |    |
+| ---------- | --------------- | --------------- | --- |
+|            | LIST COLUMNS    |   pedidos       |     |
+|            | enruta filas    | (particionadas  |     |
+|            | según el valor  | por  region     | )   |
+de la columna
+de partición
+hacia distintos
+shards
+| Vertical | Dos tablas      | VIEW      |     |
+| -------- | --------------- | --------- | --- |
+|          | Spider simples  | productos |  =  |
+más una
+VIEW  JOIN de
+
+|     | JOIN          | V_basico y  |     |
+| --- | ------------- | ----------- | --- |
+|     | reconstruyen  | V_detalle   |     |
+columnas
+distribuidas
+entre dos nodos
+| 4.  | : definición de conexiones remotas reutilizables. |     |     |
+| --- | ------------------------------------------------- | --- | --- |
+CREATE SERVER
+CREATE SERVER  almacena un conjunto de parámetros de conexión bajo un nombre simbólico.
+Las tablas Spider referencian ese nombre en el  COMMENT  en lugar de repetir IP, puerto,
+usuario y contraseña en cada definición:
+4
+
+SQL
+CREATE SERVER srv_nodo04
+FOREIGN DATA WRAPPER mysql
+OPTIONS (
+HOST '192.168.56.104',
+PORT 3306,
+DATABASE 'lab_bdd',
+USER 'spider_user',
+PASSWORD 'Spider_2025!'
+);
+-- Uso posterior en tabla Spider:
+CREATE TABLE t (...) ENGINE = SPIDER
+COMMENT = 'server "srv_nodo04", table "nombre_tabla_remota"';
+Los servidores se persisten en mysql.servers y se eliminan con DROP SERVER nombre .
+5. Tablas Spider particionadas: conexión con la Fase 12.
+Las tablas Spider clientes y pedidos del coordinador usan PARTITION BY LIST COLUMNS
+(region) . El motor aplica poda de particiones remota: ante WHERE region = 'norte' ,
+Spider envía la subconsulta solo al shard que contiene esa región. Este es exactamente el
+mismo mecanismo de la Fase 12 extendido a nodos físicamente distintos.
+La clave primaria de la tabla Spider particionada debe incluir la columna de particionamiento,
+requerimiento idéntico al del particionamiento nativo de la Fase 12:
+SQL
+PRIMARY KEY (id, region) -- region obligatoria en PK para
+Spider particionado
+La tabla remota en nodo04 puede mantener PRIMARY KEY (id) sin cambios; esta
+discrepancia
+en la definición de PK es permitida por Spider y no genera conflictos en la práctica.
+6. Por qué detalle_pedidos no puede usar PARTITION BY LIST COLUMNS (region) .
+5
+
+detalle_pedidos no tiene columna region . Spider necesita que la columna de
+particionamiento
+exista en la tabla para poder aplicar la poda. Sin region , no es posible usar el mismo
+esquema de particionamiento que clientes y pedidos . La solución adoptada es crear
+una tabla Spider simple por shard y unirlas mediante una VIEW UNION ALL , que Spider
+resuelve consultando ambos nodos y combinando los resultados en el coordinador.
+7. Transparencia de distribución lograda al finalizar la fase.
+Tipo de Mecanismo Primera fase de
+transparencia implementado verificación
+Fragmentación El cliente Fase 
+consulta
+clientes 
+productos  etc
+sin saber que
+los datos están
+divididos entre
+nodos
+Ubicación El cliente Fase 
+conecta siempre
+a
+192.168.56.10
+6  ignora la
+existencia de
+nodo y
+nodo
+Replicación Maestro- Fase 
+esclavo
+transparente
+para el cliente
+de nodo
+Concurrencia MVCC de Fase 
+InnoDB pruebas
+con
+transacciones
+concurrentes
+6
+
+C. Prerrequisitos
+Antes de iniciar esta fase, verificar que se cumplen todos los puntos siguientes:
+Estado de las máquinas virtuales:
+7
+
+| Nodo       | Snapshot  | Estado funcional  |
+| ---------- | --------- | ----------------- |
+|            | requerido | esperado          |
+| bdd-nodo01 | fase13-   | MAESTRO de        |
+|            | completa  | replicación      |
+lab_bdd  con
+///
+filas
+ESCLAVO
+| bdd-nodo02 | fase13- |     |
+| ---------- | ------- | --- |
+read_only =
+completa
+ON
+| bdd-nodo03 | fase13-  | MULTI-    |
+| ---------- | -------- | --------- |
+|            | completa | MAESTRO  |
+réplica
+bidireccional
+con nodo
+| bdd-nodo04 | fase13-  | SHARD-A:       |
+| ---------- | -------- | -------------- |
+|            | completa | clientes  (  |
+filas
+norte+este)
+pedidos  ()
+detalle_pedido
+s  (~)
+productos  (
+completo)
+server_id =
+4   bind-
+address =
+0.0.0.0
+SHARD-B:
+| bdd-nodo05 | fase13- |     |
+| ---------- | ------- | --- |
+ (
+|     | completa | clientes |
+| --- | -------- | -------- |
+filas sur+oeste)
+ ()
+pedidos
+detalle_pedido
+ (~)
+s
+ (
+productos
+completo)
+server_id =
+
+5 bind-
+address =
+0.0.0.0
+8
+
+bdd-nodo06 — No existe aún
+se crea en
+esta fase
+Conocimiento técnico requerido:
+• Fragmentación vertical columnas operacionales vs columnas de detalle ( V_basico /
+V_detalle )
+y sus predicados de correctitud tal como se diseñaron en la Fase  (DDD sección )
+• Particionamiento nativo LIST COLUMNS de MariaDB (Fase ): los mismos predicados y el
+mismo
+mecanismo de poda de particiones se usan ahora en tablas Spider del coordinador
+• Creación de clones enlazados de VirtualBox y reconfiguración de hostname e IP (Fase 
+pasos D–D)
+Recursos de host necesarios:
+• Al menos  GB de RAM adicional libre para nodo (  MB asignados)
+• Al menos  GB de disco libre para el disco delta del clon enlazado
+• La estructura C:\LabBDD\ con sus subcarpetas (creada en la Fase )
+Archivos de referencia:
+• C:\LabBDD\Documentacion\fase09-disenyo-distribuido.md — secciones 
+(fragmentación horizontal)
+y  (fragmentación vertical) son la especificación técnica que guía esta fase
+9
+
+D. Procedimiento paso a paso
+Arquitectura al inicio de la Fase 14
+Text
+bdd-nodo01 [MAESTRO | 192.168.56.101] lab_bdd completo
+(20/10/20/36 filas)
+bdd-nodo02 [ESCLAVO | 192.168.56.102] lab_bdd réplica, read_only = ON
+bdd-nodo03 [MULTI-M. | 192.168.56.103] lab_bdd réplica bidireccional
+bdd-nodo04 [SHARD-A | 192.168.56.104] clientes(10)
+pedidos(10) detalle(~18)
+productos(10, completo
+— temporal)
+bdd-nodo05 [SHARD-B | 192.168.56.105] clientes(10)
+pedidos(10) detalle(~18)
+productos(10, completo
+— temporal)
+[bdd-nodo06 NO EXISTE AÚN]
+10
+
+Arquitectura al finalizar la Fase 14
+Text
+bdd-nodo04 [SHARD-A | 192.168.56.104]
++ v_productos_basico (id, sku, nombre, categoria, precio,
+stock, fecha_creacion)
+bdd-nodo05 [SHARD-B | 192.168.56.105]
++ v_productos_detalle (id, sku, descripcion, ficha_tecnica,
+imagen_url, peso_kg)
+bdd-nodo06 [COORDINADOR | 192.168.56.106] server_id=6, log_bin=OFF,
+Spider ACTIVE
+lab_bdd (solo metadatos Spider — sin filas de datos de negocio):
+┌─ clientes [SPIDER PARTITION LIST region
+→ nodo04/nodo05]
+├─ pedidos [SPIDER PARTITION LIST region
+→ nodo04/nodo05]
+├─ spider_detalle_nodo04 [SPIDER simple
+→ nodo04.detalle_pedidos]
+├─ spider_detalle_nodo05 [SPIDER simple
+→ nodo05.detalle_pedidos]
+├─ v_productos_basico [SPIDER simple →
+nodo04.v_productos_basico]
+├─ v_productos_detalle [SPIDER simple →
+nodo05.v_productos_detalle]
+├─ VIEW detalle_pedidos [UNION ALL spider_detalle_nodo04
++ nodo05]
+└─ VIEW productos [JOIN v_productos_basico
+⋈ v_productos_detalle]
+Paso 1 — Iniciar nodo04 y nodo05; verificar el estado heredado de la Fase 13
+(conteos de filas, bind-address , server_id ).
+Paso 2 — Crear el usuario spider_user en nodo04 y en nodo05, restringido
+a la IP futura de nodo06 ( 192.168.56.106 ).
+Paso 3 — Crear la tabla v_productos_basico en nodo04 con las columnas
+operacionales y poblarla desde la tabla productos completa que ya existe en ese nodo.
+Paso 4 — Crear la tabla v_productos_detalle en nodo05 con las columnas de detalle
+y poblarla desde la tabla productos completa en ese nodo.
+11
+
+Paso 5 — Verificar las tres condiciones de correctitud de la fragmentación vertical
+en nodo04 y nodo05 (completitud, disjunción de columnas, reconstrucción simulada).
+Paso 6 — Apagar nodo04 y nodo05 antes de crear nodo06, para evitar conflicto de IP
+cuando el clon arranque temporalmente con la dirección  192.168.56.101 .
+| Paso 7 — Crear  |                 |  como clon enlazado de    |            |  tomado desde el |     |
+| --------------- | --------------- | ------------------------- | ---------- | ---------------- | --- |
+|                 | bdd-nodo06      |                           | bdd-nodo01 |                  |     |
+| snapshot        | fase07-completa |  (MariaDB instalado, sin  | lab_bdd ). |                  |     |
+Paso 8 — Arrancar solo nodo06, configurar hostname ( ), IP estática
+bdd-nodo06
+( 192.168.56.106 ) y  /etc/hosts  con las entradas de todos los nodos del laboratorio.
+Paso 9 — Crear el archivo de configuración de MariaDB del coordinador:
+|     | ,   | ,   | ,   |     | .   |
+| --- | --- | --- | --- | --- | --- |
+server_id = 6 log_bin = OFF bind-address = 0.0.0.0 skip_name_resolve = ON
+Desactivar cualquier archivo de configuración de replicación heredado del clon.
+Paso 10 — Instalar el motor Spider en nodo06 con  INSTALL SONAME 'ha_spider' .
+Verificar que el plugin queda   y que las tablas de sistema
+|     |     | ACTIVE |     | mysql.spider_* |     |
+| --- | --- | ------ | --- | -------------- | --- |
+fueron creadas.
+Paso 11 — Arrancar nodo04 y nodo05 (ya en sus IPs  .104  y  .105 ).
+Verificar conectividad TCP desde nodo06 hacia ambos shards en el puerto 3306.
+Paso 12 — Registrar los servidores remotos en nodo06 con  CREATE SERVER srv_nodo04
+| y   |     | .   |     |     |     |
+| --- | --- | --- | --- | --- | --- |
+CREATE SERVER srv_nodo05
+Paso 13 — Crear la base de datos  lab_bdd  en nodo06 y las tablas Spider para los
+fragmentos horizontales:  clientes  y  pedidos  (particionadas por  region ), y los dos
+pares de tablas Spider para  detalle_pedidos  más su  VIEW UNION ALL .
+Paso 14 — Crear las tablas Spider  v_productos_basico  y  v_productos_detalle  en
+| nodo06 y la  |                |  que las reconstruye por  | .    |     |     |
+| ------------ | -------------- | ------------------------- | ---- | --- | --- |
+|              | VIEW productos |                           | JOIN |     |     |
+Paso 15 — Ejecutar las consultas de verificación distribuida desde nodo06: acceso
+particionado a  clientes  (poda activa), ficha completa de producto (JOIN distribuido
+vertical) y consulta híbrida que combina fragmentación horizontal y vertical.
+Paso 16 — Apagar todos los nodos y tomar el snapshot  fase14-completa  en los seis
+nodos del laboratorio.
+12
+
+E. Comandos completos
+Los bloques (host) se ejecutan en PowerShell en Windows. Los bloques (VM — nodoXX)
+se ejecutan en una sesión SSH al nodo indicado. Los bloques SQL dentro de sudo mariadb
+se ejecutan en el prompt del motor MariaDB.
+E.1 Iniciar nodo04 y nodo05; verificar el estado de la Fase 13 (host)
+PowerShell
+VBoxManage startvm "bdd-nodo04" --type headless
+VBoxManage startvm "bdd-nodo05" --type headless
+Start-Sleep -Seconds 35
+Conectarse a ambos nodos:
+PowerShell
+# Terminal 1 — nodo04
+ssh bddadmin@192.168.56.104
+# Terminal 2 — nodo05
+ssh bddadmin@192.168.56.105
+Verificar el estado en (VM — nodo04):
+13
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Conteos heredados de la Fase 13
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos;
+-- Solo deben aparecer las regiones del fragmento A
+SELECT DISTINCT region AS regiones_presentes FROM clientes ORDER BY region;
+EOF
+# Verificar parámetros clave de MariaDB
+sudo mariadb -e "SHOW VARIABLES LIKE 'bind_address';"
+sudo mariadb -e "SHOW VARIABLES LIKE 'server_id';"
+Salida esperada en nodo04:
+Text
+clientes | 10
+pedidos | 10
+detalle_pedidos | ~18
+productos | 10
+regiones_presentes: este, norte
+bind_address: 0.0.0.0
+server_id: 4
+Repetir en nodo05 esperando sur, oeste y server_id = 5 .
+Si bind_address devuelve 127.0.0.1 en algún shard, corregirlo antes de continuar:
+14
+
+Bash
+sudo sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' \
+/etc/mysql/mariadb.conf.d/50-server.cnf
+sudo systemctl restart mariadb
+sudo mariadb -e "SHOW VARIABLES LIKE 'bind_address';"
+E.2 Crear el usuario spider_user en nodo04 y nodo05 (VM — nodo04 y
+nodo05)
+Ejecutar en nodo04:
+Bash
+sudo mariadb << 'EOF'
+-- ----------------------------------------------------------------
+-- Usuario de acceso remoto para Spider.
+-- Host: IP exacta de bdd-nodo06 (principio de mínimo privilegio).
+-- Privilegios: SELECT + escritura sobre lab_bdd.
+-- ----------------------------------------------------------------
+CREATE USER IF NOT EXISTS 'spider_user'@'192.168.56.106'
+IDENTIFIED BY 'Spider_2025!';
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON lab_bdd.*
+TO 'spider_user'@'192.168.56.106';
+FLUSH PRIVILEGES;
+-- Verificar
+SELECT User, Host FROM mysql.user WHERE User = 'spider_user';
+SHOW GRANTS FOR 'spider_user'@'192.168.56.106';
+EOF
+Ejecutar el mismo bloque en nodo05 sin modificaciones.
+15
+
+E.3 Crear v_productos_basico en nodo04 (VM — nodo04)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ============================================================
+-- FRAGMENTO VERTICAL A — Columnas operacionales (alta frecuencia)
+-- Nodo destino: bdd-nodo04 (192.168.56.104)
+-- Plan DDD Fase 9: id*, sku, nombre, categoria,
+-- precio, stock, fecha_creacion
+-- Uso esperado: listados, búsquedas, cálculo de precios
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v_productos_basico (
+id INT NOT NULL AUTO_INCREMENT,
+sku VARCHAR(50) NOT NULL,
+nombre VARCHAR(200) NOT NULL,
+categoria VARCHAR(100),
+precio DECIMAL(10,2) NOT NULL,
+stock INT DEFAULT 0,
+fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uq_sku (sku)
+) ENGINE = InnoDB
+DEFAULT CHARSET = utf8mb4
+COLLATE = utf8mb4_unicode_ci
+COMMENT = 'Fragmento vertical basico de productos — Fase 14';
+-- Poblar desde la tabla productos completa existente en este nodo
+-- (cargada íntegramente como catálogo temporal en la Fase 13)
+INSERT INTO v_productos_basico
+(id, sku, nombre, categoria, precio, stock, fecha_creacion)
+SELECT id, sku, nombre, categoria, precio, stock, fecha_creacion
+FROM productos;
+-- Verificar la carga
+SELECT 'Filas en v_productos_basico' AS metrica, COUNT(*) AS valor
+FROM v_productos_basico;
+-- Vista previa
+SELECT id, sku, nombre, categoria, precio, stock
+FROM v_productos_basico
+ORDER BY id;
+EOF
+16
+
+E.4 Crear v_productos_detalle en nodo05 (VM — nodo05)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ============================================================
+-- FRAGMENTO VERTICAL B — Columnas de detalle (baja frecuencia)
+-- Nodo destino: bdd-nodo05 (192.168.56.105)
+-- Plan DDD Fase 9: id*, sku, descripcion,
+-- ficha_tecnica, imagen_url, peso_kg
+-- Uso esperado: pantalla de ficha completa de producto
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v_productos_detalle (
+id INT NOT NULL,
+sku VARCHAR(50) NOT NULL,
+descripcion TEXT,
+ficha_tecnica TEXT,
+imagen_url VARCHAR(500),
+peso_kg DECIMAL(8,3),
+PRIMARY KEY (id),
+KEY idx_sku (sku)
+) ENGINE = InnoDB
+DEFAULT CHARSET = utf8mb4
+COLLATE = utf8mb4_unicode_ci
+COMMENT = 'Fragmento vertical detalle de productos — Fase 14';
+-- Poblar desde la tabla productos completa en este nodo
+INSERT INTO v_productos_detalle
+(id, sku, descripcion, ficha_tecnica, imagen_url, peso_kg)
+SELECT id, sku, descripcion, ficha_tecnica, imagen_url, peso_kg
+FROM productos;
+-- Verificar la carga
+SELECT 'Filas en v_productos_detalle' AS metrica, COUNT(*) AS valor
+FROM v_productos_detalle;
+-- Vista previa con truncado de columnas TEXT
+SELECT id, sku,
+LEFT(descripcion, 50) AS descripcion_preview,
+LEFT(ficha_tecnica, 50) AS ficha_preview,
+imagen_url,
+peso_kg
+FROM v_productos_detalle
+ORDER BY id;
+EOF
+17
+
+E.5 Verificar correctitud de la fragmentación vertical (VM — nodo04
+y nodo05)
+Ejecutar en nodo04:
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ============================================================
+-- CONDICIÓN 1: COMPLETITUD
+-- Todos los productos originales deben estar en v_productos_basico.
+-- ============================================================
+SELECT 'Completitud V_productos_basico' AS condicion,
+(SELECT COUNT(*) FROM productos) AS total_original,
+COUNT(*) AS filas_en_fragmento,
+CASE WHEN COUNT(*) = (SELECT COUNT(*) FROM productos)
+THEN 'OK' ELSE 'FALLA'
+END AS resultado
+FROM v_productos_basico;
+-- ============================================================
+-- CONDICIÓN 2: DISJUNCIÓN DE COLUMNAS NO CLAVE
+-- Las columnas TEXT de detalle NO deben existir en V_basico.
+-- ============================================================
+SELECT 'Disjunción columnas V_productos_basico' AS condicion,
+CASE WHEN COUNT(*) = 0
+THEN 'OK — sin columnas de detalle'
+ELSE CONCAT('FALLA — columnas encontradas: ',
+GROUP_CONCAT(COLUMN_NAME))
+END AS resultado
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+AND TABLE_NAME = 'v_productos_basico'
+AND COLUMN_NAME IN ('descripcion','ficha_tecnica','imagen_url','peso_kg');
+EOF
+Ejecutar en nodo05:
+18
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- COMPLETITUD de V_detalle
+SELECT 'Completitud V_productos_detalle' AS condicion,
+(SELECT COUNT(*) FROM productos) AS total_original,
+COUNT(*) AS filas_en_fragmento,
+CASE WHEN COUNT(*) = (SELECT COUNT(*) FROM productos)
+THEN 'OK' ELSE 'FALLA'
+END AS resultado
+FROM v_productos_detalle;
+-- DISJUNCIÓN: columnas operacionales NO deben estar en V_detalle
+SELECT 'Disjunción columnas V_productos_detalle' AS condicion,
+CASE WHEN COUNT(*) = 0
+THEN 'OK — sin columnas operacionales'
+ELSE CONCAT('FALLA — columnas encontradas: ',
+GROUP_CONCAT(COLUMN_NAME))
+END AS resultado
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+AND TABLE_NAME = 'v_productos_detalle'
+AND COLUMN_NAME IN
+('nombre','categoria','precio','stock','fecha_creacion');
+-- RECONSTRUCCIÓN SIMULADA (local en nodo05):
+-- JOIN entre v_productos_detalle y la tabla productos completa.
+-- Verifica que todos los IDs tienen contraparte.
+SELECT 'Reconstrucción (IDs coincidentes)' AS condicion,
+(SELECT COUNT(*) FROM productos) AS total_original,
+COUNT(*) AS filas_reconstruidas,
+CASE WHEN COUNT(*) = (SELECT COUNT(*) FROM productos)
+THEN 'OK' ELSE 'FALLA'
+END AS resultado
+FROM v_productos_detalle d
+JOIN productos p ON p.id = d.id;
+EOF
+Todos los resultados deben mostrar OK antes de continuar.
+19
+
+E.6 Apagar nodo04 y nodo05 (host)
+El clon de nodo06 arrancará temporalmente con la IP 192.168.56.101 heredada del snapshot
+de nodo01. Para evitar conflictos ARP, todos los nodos deben estar apagados:
+Bash
+# En la sesión SSH de nodo04
+sudo poweroff
+# En la sesión SSH de nodo05
+sudo poweroff
+Confirmar desde el host:
+PowerShell
+VBoxManage list runningvms
+# La salida debe estar vacía
+E.7 Crear bdd-nodo06 como clon enlazado (host)
+PowerShell
+# Se clona desde fase07-completa de nodo01:
+# MariaDB 10.11 instalado + utf8mb4 activo, SIN lab_bdd.
+# Esta es la base más limpia para un coordinador que no almacena
+# datos de negocio propios, solo metadatos Spider.
+VBoxManage clonevm "bdd-nodo01" `
+--snapshot "fase07-completa" `
+--options linked `
+--name "bdd-nodo06" `
+--basefolder "C:\LabBDD\VMs" `
+--register
+VBoxManage modifyvm "bdd-nodo06" `
+--description "COORDINADOR Spider. Sin datos de negocio. IP 192.168.56.106.
+server_id=6. Fase 14."
+# Confirmar registro
+VBoxManage showvminfo "bdd-nodo06" | findstr /I "Name State Memory"
+Arrancar solo nodo06 (los demás están apagados — sin conflicto de IP):
+20
+
+PowerShell
+VBoxManage startvm "bdd-nodo06" --type headless
+Start-Sleep -Seconds 35
+# El clon tiene temporalmente la IP de nodo01 (192.168.56.101)
+ssh bddadmin@192.168.56.101
+E.8 Configurar hostname, IP y /etc/hosts en nodo06 (VM — nodo06)
+Bash
+# ── 1. Cambiar el hostname ────────────────────────────────────
+sudo hostnamectl set-hostname bdd-nodo06
+sudo sed -i 's/bdd-nodo01/bdd-nodo06/g' /etc/hosts
+hostname
+# Esperado: bdd-nodo06
+Bash
+# ── 2. Cambiar la IP de .101 a .106 ──────────────────────────
+NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -1)
+echo "Archivo Netplan detectado: $NETPLAN_FILE"
+# Verificar contenido antes de editar
+cat "$NETPLAN_FILE"
+# Sustituir la dirección IP
+sudo sed -i 's/192\.168\.56\.101/192.168.56.106/g' "$NETPLAN_FILE"
+# Confirmar el cambio
+grep "192.168" "$NETPLAN_FILE"
+# Aplicar — la sesión SSH se interrumpe en este punto
+sudo netplan apply
+La sesión SSH se pierde al cambiar la IP. Reconectar desde el host:
+PowerShell
+Start-Sleep -Seconds 8
+ssh bddadmin@192.168.56.106
+21
+
+Bash
+# ── 3. Verificar la nueva IP ──────────────────────────────────
+ip addr show | grep "192.168.56"
+# Esperado: inet 192.168.56.106/24
+ping -c 2 192.168.56.1 # host Windows — debe responder
+Bash
+# ── 4. Regenerar claves SSH (el clon heredó las de nodo01) ───
+sudo rm -f /etc/ssh/ssh_host_*
+sudo ssh-keygen -A
+sudo systemctl restart ssh
+echo "Nuevas claves SSH generadas:"
+ls /etc/ssh/ssh_host_*.pub
+Bash
+# ── 5. Registrar todos los nodos en /etc/hosts ────────────────
+sudo tee -a /etc/hosts > /dev/null << 'EOF'
+# Laboratorio BDD — nodos del cluster
+192.168.56.101 bdd-nodo01
+192.168.56.102 bdd-nodo02
+192.168.56.103 bdd-nodo03
+192.168.56.104 bdd-nodo04
+192.168.56.105 bdd-nodo05
+192.168.56.106 bdd-nodo06
+EOF
+cat /etc/hosts
+22
+
+E.9 Configurar MariaDB en nodo06 (VM — nodo06)
+Bash
+# Desactivar archivos de configuración de replicación heredados del clon
+for f in /etc/mysql/mariadb.conf.d/60-replication*.cnf; do
+[ -f "$f" ] && sudo mv "$f" "${f}.bak" && echo "Desactivado: $f"
+done
+# Si se hereda bind-address = 127.0.0.1 en 50-server.cnf, corregirlo
+sudo sed -i \
+'s/^bind-address[](:space:)*=.*/bind-address = 0.0.0.0/' \
+/etc/mysql/mariadb.conf.d/50-server.cnf
+# Crear el archivo de configuración del coordinador
+sudo tee /etc/mysql/mariadb.conf.d/60-coordinador.cnf > /dev/null << 'EOF'
+# ===========================================================
+# Configuración del coordinador Spider — bdd-nodo06
+# IP: 192.168.56.106 | server_id: 6
+# Fase 14 del Laboratorio BDD.
+# ===========================================================
+[mariadb]
+# Identificación única del nodo en el ecosistema
+server_id = 6
+# El coordinador NO replica hacia otros nodos
+# y NO actúa como esclavo de ningún maestro
+log_bin = OFF
+skip_slave_start = ON
+# Sin restricción de solo lectura: el coordinador acepta escrituras
+read_only = OFF
+# Aceptar conexiones desde cualquier interfaz de la red Host-Only
+bind-address = 0.0.0.0
+# Requerido por Spider: evitar resolución DNS que cause timeouts
+skip_name_resolve = ON
+EOF
+Reiniciar MariaDB y verificar:
+23
+
+Bash
+sudo systemctl restart mariadb
+sudo systemctl status mariadb --no-pager -l
+sudo mariadb << 'EOF'
+SHOW VARIABLES LIKE 'server_id';
+SHOW VARIABLES LIKE 'log_bin';
+SHOW VARIABLES LIKE 'read_only';
+SHOW VARIABLES LIKE 'bind_address';
+SHOW VARIABLES LIKE 'skip_name_resolve';
+EOF
+Salida esperada:
+Text
+server_id → 6
+log_bin → OFF
+read_only → OFF
+bind_address → 0.0.0.0
+skip_name_resolve → ON
+24
+
+E.10 Instalar y habilitar el motor Spider (VM — nodo06)
+Bash
+sudo mariadb << 'EOF'
+-- ----------------------------------------------------------------
+-- Instalar el plugin Spider.
+-- INSTALL SONAME carga ha_spider.so dinámicamente y crea las
+-- tablas de sistema necesarias en la base de datos mysql.
+-- En MariaDB 10.11 el plugin está incluido en el paquete base.
+-- ----------------------------------------------------------------
+INSTALL SONAME 'ha_spider';
+-- Verificar que Spider quedó activo
+SELECT PLUGIN_NAME,
+PLUGIN_VERSION,
+PLUGIN_STATUS,
+PLUGIN_TYPE
+FROM information_schema.PLUGINS
+WHERE PLUGIN_NAME = 'SPIDER';
+-- Las tablas de sistema deben existir en mysql
+SHOW TABLES IN mysql LIKE 'spider%';
+-- Confirmar que Spider aparece como motor disponible
+SELECT ENGINE, SUPPORT
+FROM information_schema.ENGINES
+WHERE ENGINE = 'SPIDER';
+EOF
+Salida esperada:
+Text
+PLUGIN_NAME PLUGIN_STATUS PLUGIN_TYPE
+SPIDER ACTIVE STORAGE ENGINE
+Tablas spider* en mysql:
+spider_link_failed_log spider_link_mon_servers spider_tables
+spider_xa spider_xa_failed_log spider_xa_member
+ENGINE SUPPORT
+SPIDER YES
+Si PLUGIN_STATUS es DISABLED o la instalación falla con ERROR 1126 :
+25
+
+Bash
+# Instalar el paquete del plugin desde apt
+sudo apt-get update && sudo apt-get install -y mariadb-plugin-spider
+# Reintentar la instalación en MariaDB
+sudo mariadb -e "INSTALL SONAME 'ha_spider';"
+# Si las tablas de sistema no se crearon automáticamente:
+SPIDER_SQL=$(find /usr/share/mysql* -name "install_spider.sql" 2>/dev/null |
+head -1)
+[ -n "$SPIDER_SQL" ] && sudo mariadb < "$SPIDER_SQL" && echo
+"Script ejecutado."
+E.11 Arrancar nodo04 y nodo05; verificar conectividad (host + VM)
+PowerShell
+# Con nodo06 ya en .106, arrancar los shards sin conflicto de IP
+VBoxManage startvm "bdd-nodo04" --type headless
+VBoxManage startvm "bdd-nodo05" --type headless
+Start-Sleep -Seconds 35
+Verificar conectividad TCP desde nodo06 antes de crear tablas Spider:
+Bash
+# En nodo06 — verificar acceso a nodo04
+mysql -h 192.168.56.104 -P 3306 \
+-u spider_user -p'Spider_2025!' \
+-e "SELECT 'nodo04 accesible' AS estado, @@hostname AS host,
+@@server_id AS srv_id;" 2>&1
+# Verificar acceso a nodo05
+mysql -h 192.168.56.105 -P 3306 \
+-u spider_user -p'Spider_2025!' \
+-e "SELECT 'nodo05 accesible' AS estado, @@hostname AS host,
+@@server_id AS srv_id;" 2>&1
+Salida esperada para cada nodo:
+26
+
+Text
++------------------+------------+--------+
+| estado | host | srv_id |
++------------------+------------+--------+
+| nodo04 accesible | bdd-nodo04 | 4 |
++------------------+------------+--------+
+Si alguno devuelve ERROR 2003 , revisar la sección G antes de continuar.
+27
+
+E.12 Registrar los servidores remotos con CREATE SERVER (VM — nodo06)
+Bash
+sudo mariadb << 'EOF'
+-- ================================================================
+-- SERVIDORES REMOTOS
+-- Las credenciales se almacenan una sola vez en mysql.servers.
+-- Las tablas Spider referencian solo el nombre del servidor,
+-- manteniendo el COMMENT limpio y evitando repetición.
+-- ================================================================
+CREATE SERVER IF NOT EXISTS srv_nodo04
+FOREIGN DATA WRAPPER mysql
+OPTIONS (
+HOST '192.168.56.104',
+PORT 3306,
+DATABASE 'lab_bdd',
+USER 'spider_user',
+PASSWORD 'Spider_2025!'
+);
+CREATE SERVER IF NOT EXISTS srv_nodo05
+FOREIGN DATA WRAPPER mysql
+OPTIONS (
+HOST '192.168.56.105',
+PORT 3306,
+DATABASE 'lab_bdd',
+USER 'spider_user',
+PASSWORD 'Spider_2025!'
+);
+-- Verificar que ambos servidores quedaron registrados
+SELECT Server_name AS servidor,
+Host AS ip,
+Db AS base_datos,
+Username AS usuario,
+Port AS puerto
+FROM mysql.servers
+ORDER BY Server_name;
+EOF
+Resultado esperado: 2 filas con srv_nodo04 ( .104 ) y srv_nodo05 ( .105 ).
+28
+
+E.13 Crear lab_bdd y tablas Spider para fragmentos horizontales (VM —
+nodo06)
+Bash
+sudo mariadb << 'EOF'
+-- Base de datos del coordinador
+-- No contiene filas de datos de negocio; solo definiciones Spider y VIEWs
+CREATE DATABASE IF NOT EXISTS lab_bdd
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_unicode_ci
+COMMENT 'Coordinador Spider — Fase 14. Metadatos sin datos locales.';
+USE lab_bdd;
+-- ================================================================
+-- TABLA SPIDER: clientes
+-- PARTITION BY LIST COLUMNS (region):
+-- frag_A (norte, este) → nodo04
+-- frag_B (sur, oeste) → nodo05
+-- Con WHERE region = 'norte', Spider envía la subconsulta solo a
+-- nodo04 (poda remota activa). Sin filtro, consulta ambos y hace
+-- UNION ALL de los resultados.
+-- PRIMARY KEY (id, region) es obligatoria con PARTITION Spider.
+-- ================================================================
+CREATE TABLE IF NOT EXISTS clientes (
+id INT NOT NULL AUTO_INCREMENT,
+nombre VARCHAR(100) NOT NULL,
+apellido VARCHAR(100) NOT NULL,
+email VARCHAR(150),
+telefono VARCHAR(20),
+region ENUM('norte','sur','este','oeste') NOT NULL,
+ciudad VARCHAR(100),
+fecha_alta DATETIME DEFAULT CURRENT_TIMESTAMP,
+ultima_modificacion DATETIME DEFAULT NULL,
+PRIMARY KEY (id, region)
+) ENGINE = SPIDER
+PARTITION BY LIST COLUMNS (region) (
+PARTITION frag_A VALUES IN ('norte', 'este')
+COMMENT = 'server "srv_nodo04", table "clientes"',
+PARTITION frag_B VALUES IN ('sur', 'oeste')
+COMMENT = 'server "srv_nodo05", table "clientes"'
+);
+-- ================================================================
+-- TABLA SPIDER: pedidos
+-- Mismo esquema de particionamiento que clientes.
+29
+
+-- ================================================================
+CREATE TABLE IF NOT EXISTS pedidos (
+id INT NOT NULL AUTO_INCREMENT,
+cliente_id INT NOT NULL,
+region ENUM('norte','sur','este','oeste') NOT NULL,
+fecha_pedido DATETIME DEFAULT CURRENT_TIMESTAMP,
+estado ENUM('pendiente','procesado','enviado',
+'entregado','cancelado') DEFAULT 'pendiente',
+total DECIMAL(10,2),
+PRIMARY KEY (id, region)
+) ENGINE = SPIDER
+PARTITION BY LIST COLUMNS (region) (
+PARTITION frag_A VALUES IN ('norte', 'este')
+COMMENT = 'server "srv_nodo04", table "pedidos"',
+PARTITION frag_B VALUES IN ('sur', 'oeste')
+COMMENT = 'server "srv_nodo05", table "pedidos"'
+);
+-- ================================================================
+-- TABLAS SPIDER para detalle_pedidos
+-- detalle_pedidos no tiene columna region: no se puede aplicar
+-- PARTITION BY LIST COLUMNS (region) directamente.
+-- Solución: tabla Spider simple por shard + VIEW UNION ALL.
+-- ================================================================
+CREATE TABLE IF NOT EXISTS spider_detalle_nodo04 (
+id INT NOT NULL AUTO_INCREMENT,
+pedido_id INT NOT NULL,
+producto_id INT NOT NULL,
+cantidad INT NOT NULL DEFAULT 1,
+precio_unitario DECIMAL(10,2) NOT NULL,
+subtotal DECIMAL(10,2),
+PRIMARY KEY (id)
+) ENGINE = SPIDER
+COMMENT = 'server "srv_nodo04", table "detalle_pedidos"';
+CREATE TABLE IF NOT EXISTS spider_detalle_nodo05 (
+id INT NOT NULL AUTO_INCREMENT,
+pedido_id INT NOT NULL,
+producto_id INT NOT NULL,
+cantidad INT NOT NULL DEFAULT 1,
+precio_unitario DECIMAL(10,2) NOT NULL,
+subtotal DECIMAL(10,2),
+PRIMARY KEY (id)
+) ENGINE = SPIDER
+COMMENT = 'server "srv_nodo05", table "detalle_pedidos"';
+-- VIEW que unifica ambos shards de detalle_pedidos
+CREATE OR REPLACE VIEW detalle_pedidos AS
+30
+
+SELECT * FROM spider_detalle_nodo04
+UNION ALL
+SELECT * FROM spider_detalle_nodo05;
+-- ================================================================
+-- VERIFICACIÓN INMEDIATA — fragmentos horizontales desde nodo06
+-- ================================================================
+SELECT 'clientes (Spider, 2 shards)' AS fuente, COUNT(*) AS filas
+FROM clientes
+UNION ALL
+SELECT 'pedidos (Spider, 2 shards)', COUNT(*)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos (VIEW UNION ALL)', COUNT(*)
+FROM detalle_pedidos;
+-- Resultado esperado: 20 / 20 / ~36
+EOF
+31
+
+E.14 Crear tablas Spider para fragmentos verticales y VIEW productos
+(VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ================================================================
+-- TABLA SPIDER: v_productos_basico → nodo04
+-- Columnas operacionales. Solo activa nodo04 cuando se consulta.
+-- ================================================================
+CREATE TABLE IF NOT EXISTS v_productos_basico (
+id INT NOT NULL AUTO_INCREMENT,
+sku VARCHAR(50) NOT NULL,
+nombre VARCHAR(200) NOT NULL,
+categoria VARCHAR(100),
+precio DECIMAL(10,2) NOT NULL,
+stock INT DEFAULT 0,
+fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (id),
+UNIQUE KEY uq_sku (sku)
+) ENGINE = SPIDER
+COMMENT = 'server "srv_nodo04", table "v_productos_basico"';
+-- ================================================================
+-- TABLA SPIDER: v_productos_detalle → nodo05
+-- Columnas de detalle (TEXT). Solo activa nodo05 cuando se consulta.
+-- ================================================================
+CREATE TABLE IF NOT EXISTS v_productos_detalle (
+id INT NOT NULL,
+sku VARCHAR(50) NOT NULL,
+descripcion TEXT,
+ficha_tecnica TEXT,
+imagen_url VARCHAR(500),
+peso_kg DECIMAL(8,3),
+PRIMARY KEY (id),
+KEY idx_sku (sku)
+) ENGINE = SPIDER
+COMMENT = 'server "srv_nodo05", table "v_productos_detalle"';
+-- ================================================================
+-- VIEW: productos
+-- Reconstruye la relación completa mediante JOIN entre los dos
+-- fragmentos verticales. Para el cliente en nodo06:
+-- SELECT * FROM productos → indistinguible de una tabla local.
+-- Internamente: Spider envía subconsulta a nodo04 y a nodo05,
+-- el coordinador hace el JOIN y devuelve la fila completa.
+32
+
+-- ================================================================
+CREATE OR REPLACE VIEW productos AS
+SELECT
+b.id,
+b.sku,
+b.nombre,
+b.categoria,
+b.precio,
+b.stock,
+d.descripcion,
+d.ficha_tecnica,
+d.imagen_url,
+d.peso_kg,
+b.fecha_creacion
+FROM v_productos_basico b
+JOIN v_productos_detalle d ON b.id = d.id;
+-- ================================================================
+-- VERIFICACIONES DE LOS FRAGMENTOS VERTICALES
+-- ================================================================
+SELECT 'v_productos_basico (Spider → nodo04)' AS fuente, COUNT(*)
+AS productos
+FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle (Spider → nodo05)', COUNT(*)
+FROM v_productos_detalle
+UNION ALL
+SELECT 'productos VIEW (JOIN distribuido)', COUNT(*)
+FROM productos;
+-- Resultado esperado: 10 / 10 / 10
+-- Inspección del primer producto completamente reconstruido
+SELECT id, sku, nombre, categoria, precio, stock,
+LEFT(descripcion, 50) AS descripcion_preview,
+LEFT(ficha_tecnica, 50) AS ficha_preview,
+imagen_url,
+peso_kg
+FROM productos
+WHERE id = 1;
+EOF
+33
+
+E.15 Consultas de verificación distribuida desde nodo06 (VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ================================================================
+-- CONSULTA 1: Clientes de una sola región — poda Spider activa
+-- WHERE region = 'norte' → Spider consulta solo frag_A (nodo04).
+-- ================================================================
+SELECT id,
+CONCAT(nombre, ' ', apellido) AS cliente,
+region,
+ciudad
+FROM clientes
+WHERE region = 'norte'
+ORDER BY id;
+-- ================================================================
+-- CONSULTA 2: Conteo de clientes por región (ambos shards)
+-- Sin filtro → Spider consulta nodo04 Y nodo05 con UNION ALL.
+-- ================================================================
+SELECT region,
+COUNT(*) AS clientes_por_region
+FROM clientes
+GROUP BY region
+ORDER BY region;
+-- ================================================================
+-- CONSULTA 3: Productos con stock disponible (solo V_basico)
+-- Solo activa nodo04; nodo05 no interviene.
+-- ================================================================
+SELECT sku, nombre, categoria, precio, stock
+FROM v_productos_basico
+WHERE stock > 0
+ORDER BY precio DESC;
+-- ================================================================
+-- CONSULTA 4: Ficha completa de un producto (JOIN distribuido)
+-- Activa nodo04 (v_productos_basico) Y nodo05 (v_productos_detalle).
+-- ================================================================
+SELECT id, sku, nombre, categoria, precio, stock,
+descripcion, ficha_tecnica, imagen_url, peso_kg
+FROM productos
+WHERE id = 2;
+-- ================================================================
+-- CONSULTA 5: Pedidos con datos de cliente (JOIN en shards)
+-- Spider usa poda en ambas tablas particionadas.
+-- ================================================================
+34
+
+SELECT c.region,
+CONCAT(c.nombre, ' ', c.apellido) AS cliente,
+p.id AS pedido,
+p.estado,
+p.total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+ORDER BY c.region, p.id;
+-- ================================================================
+-- CONSULTA 6: HÍBRIDA — facturación por región con categorías
+-- Cruza fragmentación HORIZONTAL (clientes/pedidos/detalle)
+-- con fragmentación VERTICAL (v_productos_basico para categoría).
+-- ================================================================
+SELECT c.region,
+COUNT(DISTINCT c.id) AS clientes_activos,
+COUNT(DISTINCT p.id) AS num_pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria
+ORDER BY vb.categoria) AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS facturacion_total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+GROUP BY c.region
+ORDER BY facturacion_total DESC;
+-- Resultado esperado: 4 filas con datos de facturación no nulos
+-- ================================================================
+-- CONSULTA 7: EXPLAIN — demostración de poda Spider
+-- ================================================================
+EXPLAIN SELECT id, nombre, ciudad
+FROM clientes
+WHERE region = 'norte';
+EXPLAIN SELECT id, nombre, ciudad
+FROM clientes;
+-- ================================================================
+-- RESUMEN GLOBAL — todas las métricas desde el coordinador
+-- ================================================================
+SELECT 'clientes (2 shards, PARTITION Spider)' AS metrica, COUNT(*) AS
+valor FROM clientes
+UNION ALL
+SELECT 'pedidos (2 shards, PARTITION Spider)', COUNT(*)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos (VIEW UNION ALL)', COUNT(*)
+FROM detalle_pedidos
+35
+
+UNION ALL
+SELECT 'v_productos_basico (Spider → nodo04)', COUNT(*)
+FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle (Spider → nodo05)', COUNT(*)
+FROM v_productos_detalle
+UNION ALL
+SELECT 'productos VIEW (JOIN distribuido)', COUNT(*)
+FROM productos;
+-- Resultado esperado:
+-- clientes → 20
+-- pedidos → 20
+-- detalle_pedidos → ~36
+-- v_productos_basico → 10
+-- v_productos_detalle → 10
+-- productos → 10
+EOF
+E.16 Apagar las VMs y tomar los snapshots fase14-completa (host)
+Bash
+# Desde la sesión SSH de nodo06
+sudo poweroff
+# Desde la sesión SSH de nodo04 (si sigue abierta)
+sudo poweroff
+# Desde la sesión SSH de nodo05 (si sigue abierta)
+sudo poweroff
+Confirmar:
+PowerShell
+VBoxManage list runningvms
+# Salida esperada: vacía
+Tomar los snapshots en los seis nodos:
+36
+
+PowerShell
+VBoxManage snapshot "bdd-nodo01" take "fase14-completa" `
+--description "Sin cambios en Fase 14. Nodo de referencia. Snapshot de hito."
+VBoxManage snapshot "bdd-nodo02" take "fase14-completa" `
+--description "Sin cambios en Fase 14. Esclavo de replicacion. Snapshot
+de hito."
+VBoxManage snapshot "bdd-nodo03" take "fase14-completa" `
+--description "Sin cambios en Fase 14. Nodo multi-maestro. Snapshot de hito."
+VBoxManage snapshot "bdd-nodo04" take "fase14-completa" `
+--description "SHARD-A: v_productos_basico creada y poblada (10 filas).
+spider_user@192.168.56.106 con SELECT/INSERT/UPDATE/DELETE en lab_bdd.*."
+VBoxManage snapshot "bdd-nodo05" take "fase14-completa" `
+--description "SHARD-B: v_productos_detalle creada y poblada (10 filas).
+spider_user@192.168.56.106 con SELECT/INSERT/UPDATE/DELETE en lab_bdd.*."
+VBoxManage snapshot "bdd-nodo06" take "fase14-completa" `
+--description "COORDINADOR: Spider ACTIVE, server_id=6, log_bin=OFF. CREATE
+SERVER nodo04/nodo05. Spider tables: clientes, pedidos (PARTITION LIST
+region), spider_detalle_nodo04/05, v_productos_basico, v_productos_detalle.
+VIEWs: detalle_pedidos (UNION ALL), productos (JOIN). Consultas
+distribuidas verificadas."
+Confirmar:
+PowerShell
+VBoxManage snapshot "bdd-nodo04" list
+VBoxManage snapshot "bdd-nodo05" list
+VBoxManage snapshot "bdd-nodo06" list
+nodo04 y nodo05 deben mostrar fase05-completa hasta fase14-completa . nodo06 muestra
+únicamente fase14-completa (primer snapshot de esta VM).
+F. Verificación de funcionamiento
+Esta fase se considera completa cuando se cumplen todos los puntos siguientes:
+ SELECT COUNT(*) FROM lab_bdd.v_productos_basico en nodo devuelve exactamente
+
+37
+
+ SELECT COUNT(*) FROM lab_bdd.v_productos_detalle  en nodo devuelve exactamente
+
+ DESCRIBE lab_bdd.v_productos_basico  en nodo no muestra las columnas
+| descripcion   |              |     |              |     |
+| ------------- | ------------- | --- | ------------ | --- |
+| ficha_tecnica |   imagen_url |     |  ni  peso_kg |    |
+ DESCRIBE lab_bdd.v_productos_detalle  en nodo no muestra las columnas  nombre 
+| categoria |   precio |   stock |  ni  fecha_creacion |    |
+| --------- | --------- | -------- | ------------------- | --- |
+ Las verificaciones de correctitud del paso E devuelven  OK  para completitud y disjunción
+de columnas en ambos nodos
+ ip addr show  en nodo muestra la dirección  192.168.56.106/24 
+|  hostname                        |  en nodo devuelve  |     | bdd-nodo06               |    |
+| ---------------------------------- | -------------------- | --- | ------------------------ | --- |
+|  SHOW VARIABLES LIKE 'server_id' |                      |     |  en nodo devuelve    |     |
+|  SHOW VARIABLES LIKE 'log_bin'   |                      |     |  en nodo devuelve OFF |     |
+ SELECT PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME =
+'SPIDER'
+en nodo devuelve ACTIVE
+ SHOW TABLES IN mysql LIKE 'spider%'  en nodo devuelve al menos  tablas de
+sistema
+ SELECT Server_name, Host FROM mysql.servers ORDER BY Server_name  en nodo
+muestra
+exactamente  filas  srv_nodo04  con IP  .104  y  srv_nodo05  con IP  .105 
+ mysql -h 192.168.56.104 -u spider_user -p'Spider_2025!' -e "SELECT 1"  ejecutado
+| desde nodo devuelve  |     |  sin errores |     |     |
+| ---------------------- | --- | ------------- | --- | --- |
+1
+  ejecutado
+mysql -h 192.168.56.105 -u spider_user -p'Spider_2025!' -e "SELECT 1"
+| desde nodo devuelve  |     | 1  sin errores |     |     |
+| ---------------------- | --- | --------------- | --- | --- |
+ SELECT COUNT(*) FROM lab_bdd.clientes  en nodo devuelve 
+ SELECT COUNT(*) FROM lab_bdd.pedidos  en nodo devuelve 
+ SELECT COUNT(*) FROM lab_bdd.detalle_pedidos  en nodo devuelve el total correcto
+ SELECT COUNT(*) FROM lab_bdd.v_productos_basico  en nodo devuelve  (desde
+nodo)
+ SELECT COUNT(*) FROM lab_bdd.v_productos_detalle  en nodo devuelve  (desde
+nodo)
+ SELECT COUNT(*) FROM lab_bdd.productos  (VIEW) en nodo devuelve  (JOIN
+distribuido)
+ La Consulta  (híbrida) de E devuelve exactamente  filas con valores de
+facturación no nulos una por cada región del dominio
+38
+
+ EXPLAIN SELECT * FROM clientes WHERE region = 'norte'  en nodo muestra
+únicamente
+| frag_A  en la columna  | partitions |    |
+| ---------------------- | ---------- | --- |
+ EXPLAIN SELECT * FROM clientes  sin filtro en nodo muestra ambas particiones
+| ( frag_A  y  frag_B ) |     |     |
+| ---------------------- | --- | --- |
+ SHOW TABLES IN lab_bdd  en nodo devuelve exactamente  clientes   pedidos 
+spider_detalle_nodo04   spider_detalle_nodo05   v_productos_basico 
+v_productos_detalle  y las VIEWs  detalle_pedidos  y  productos 
+ Los snapshots  fase14-completa  existen en los seis nodos del laboratorio
+39
+
+G. Problemas comunes y soluciones
+| Problema          | Causa probable | Solución         |     |
+| ----------------- | -------------- | ---------------- | --- |
+| INSTALL SONAME    | El archivo     | Ejecutar  sudo   |     |
+| 'ha_spider'       |   ha_spider.so |   apt-get        |     |
+| falla con  ERROR  | no está en la  | install -y       |     |
+| 1126: Can't       | instalación    | mariadb-         |     |
+| open shared       | actual de      | plugin-spider    |     |
+|                   | MariaDB        | y reintentar el  |     |
+library
+INSTALL
+'ha_spider'
+SONAME 
+verificar ruta
+con  find
+/usr/lib/mysql
+/usr/lib/maria
+db -name
+"ha_spider*"
+2>/dev/null
+| SELECT ...     | Spider no           | Probar desde         |     |
+| -------------- | ------------------- | -------------------- | --- |
+| FROM clientes  |   alcanza el shard  | nodo:  mysql       |     |
+| en nodo      | remoto             | bind- -h             |     |
+| devuelve       | ERROR  address =    | 192.168.56.104       |     |
+| 12502: Unable  | 127.0.0.1           |  en  -u spider_user  |     |
+| to connect to  | nodo/          | -                    |     |
+| foreign data   | firewall activo o  | p'Spider_2025!       |     |
+| source         | credenciales        | ' -e "SELECT         |     |
+incorrectas  si falla
+1"
+verificar
+SHOW
+VARIABLES LIKE
+'bind_address
+'  en nodo y
+que el usuario
+existe con
+SELECT User,
+Host FROM
+mysql.user
+WHERE
+User='spider_u
+ser'
+| ERROR 1429:  | Las              | Verificar en  |     |
+| ------------ | ---------------- | ------------- | --- |
+|              | credenciales de  | nodo/:    |     |
+Unable to
+|     | CREATE SERVER |   SHOW GRANTS  |     |
+| --- | ------------- | -------------- | --- |
+connect to
+40
+
+| foreign data  | no coinciden               | FOR            |     |
+| ------------- | -------------------------- | -------------- | --- |
+| source        |  al crear  con el usuario  | 'spider_user'@ |     |
+| tabla Spider  | real del nodo              | '192.168.56.10 |     |
+|               | remoto                     | 6'  ejecutar  |     |
+GRANT SELECT,
+INSERT,
+UPDATE, DELETE
+ON lab_bdd.*
+TO
+'spider_user'@
+'192.168.56.10
+6'; FLUSH
+|     |     | PRIVILEGES; |  si  |
+| --- | --- | ----------- | ---- |
+el usuario no
+tiene los
+privilegios
+correctos
+| La VIEW           | Los IDs en       | Verificar con   |     |
+| ----------------- | ---------------- | --------------- | --- |
+| productos         |   v_productos_ba | SELECT id FROM  |     |
+| devuelve  filas  | sico  (nodo)   | lab_bdd.v_prod  |     |
+| aunque los        | y en             | uctos_basico    |     |
+fragmentos
+|     | v_productos_de | ORDER BY id |     |
+| --- | -------------- | ----------- | --- |
+tienen  filas
+talle   en nodo y
+cada uno
+|     | (nodo) no  | SELECT id FROM  |     |
+| --- | ------------ | --------------- | --- |
+|     | coinciden    | lab_bdd.v_prod  |     |
+uctos_detalle
+|     |     | ORDER BY id |     |
+| --- | --- | ----------- | --- |
+en nodo si
+difieren
+repoblar el
+fragmento
+incorrecto con
+TRUNCATE
+TABLE; INSERT
+INTO ...
+SELECT ...
+FROM productos
+ORDER BY id
+| CREATE SERVER |   Ya existe un    | Ejecutar  DROP  |     |
+| ------------- | ----------------- | --------------- | --- |
+| falla con     | servidor con ese  |                 |     |
+|               | ERROR             | SERVER IF       |     |
+nombre de una
+| 1409: Failed  |     | EXISTS  |     |
+| ------------- | --- | ------- | --- |
+ejecución previa
+| to create  |     | srv_nodo04;  |     |
+| ---------- | --- | ------------ | --- |
+DROP SERVER IF
+41
+
+| default          |                      | EXISTS         |     |
+| ---------------- | -------------------- | -------------- | --- |
+| foreign          |                      | srv_nodo05;    |  y  |
+| server           |                      | recrearlos     |     |
+| La tabla Spider  | La definición        | Verificar con  |     |
+| clientes         |  en  Spider incluye  | DESCRIBE       |     |
+esa columna
+| nodo          |                | lab_bdd.client |     |
+| --------------- | -------------- | -------------- | --- |
+| devuelve error  | pero la tabla  |                |     |
+es  en nodo
+| por columna  | remota fue  |     |     |
+| ------------ | ----------- | --- | --- |
+si la columna no
+creada antes de
+| ultima_modific |                | existe eliminarla  |     |
+| -------------- | -------------- | ------------------- | --- |
+|                | que existiera  | de la definición    |     |
+acion
+|     | (snapshot pre- | Spider  |     |
+| --- | -------------- | -------- | --- |
+ALTER
+Fase )
+TABLE clientes
+DROP COLUMN
+ultima_modific
+acion;  en
+nodo
+| VBoxManage      | El nombre           | Ejecutar       |     |
+| --------------- | ------------------- | -------------- | --- |
+| clonevm         |  falla  exacto del  | VBoxManage     |     |
+| con  Could not  | snapshot difiere    | snapshot "bdd- |     |
+| find a          | (espacios          | nodo01" list   |     |
+| snapshot named  | mayúsculas         | y copiar el    |     |
+|                 | caracteres          | nombre exacto  |     |
+'fase07-
+especiales)
+del snapshot
+completa'
+correspondiente
+a la instalación
+de MariaDB
+| SSH a  .101      |   nodo sigue   | Verificar con  |     |
+| ---------------- | ---------------- | -------------- | --- |
+| conecta al nodo  | encendido con    | VBoxManage     |     |
+| equivocado       | la misma IP que  | list           |     |
+| durante la       | el clon          | runningvms     |     |
+| configuración    |                  | que nodo     |     |
+| de nodo        |                  | esté apagado   |     |
+antes de
+arrancar
+nodo (paso
+E)
+| netplan apply    |   El archivo  | Usar el        |       |
+| ---------------- | ------------- | -------------- | ----- |
+| falla con error  | .yaml  tiene  | comando        | sed - |
+| de sintaxis      | problemas de  | i              |       |
+| YAML             | indentación   | 's/192\\.168\\ |       |
+.56\\.101/192.
+|     |     | 168.56.106/g' |     |
+| --- | --- | ------------- | --- |
+en lugar de
+42
+
+editar
+manualmente
+validar con
+sudo netplan
+try  antes de
+aplicar YAML
+requiere
+espacios no
+tabulaciones
+| EXPLAIN  en      | Algunos clientes  | Usar la sintaxis  |     |
+| ---------------- | ----------------- | ----------------- | --- |
+| tabla Spider     | MariaDB no        | alternativa       |     |
+| particionada no  | despliegan esta   | EXPLAIN           |     |
+| muestra la       | columna           | PARTITIONS        |     |
+automáticament
+| columna  |     | SELECT ... |    |
+| -------- | --- | ---------- | --- |
+e para tablas
+| partitions |     | también se  |     |
+| ---------- | --- | ----------- | --- |
+Spider
+puede verificar
+la poda
+observando
+SHOW STATUS
+LIKE
+'Handler_read%
+ antes y
+'
+después de
+consultas con y
+sin filtro de
+región
+| La Consulta   | Alguna región    | Verificar que  |     |
+| -------------- | ---------------- | -------------- | --- |
+| (híbrida)      | no tiene líneas  |                |     |
+spider_detalle
+| devuelve menos  | de  |         |     |
+| --------------- | --- | ------- | --- |
+|                 |     | _nodo04 |  y  |
+de  filas
+|     | detalle_pedido | spider_detalle |     |
+| --- | -------------- | -------------- | --- |
+ con
+|     | s   | _nodo05 |  tienen  |
+| --- | --- | ------- | -------- |
+coincidencia en
+filas ( SELECT
+|     | v_productos_ba | COUNT(*) FROM  |      |
+| --- | -------------- | -------------- | ---- |
+|     | sico           | spider_detalle |      |
+|     |                | _nodo04        |  en  |
+nodo)
+|     |     | cambiar el  | JOIN  |
+| --- | --- | ----------- | ----- |
+v_productos_ba
+|     |     | sico  por  | LEFT  |
+| --- | --- | ---------- | ----- |
+JOIN  si el
+problema es
+exclusión de
+43
+
+regiones sin
+productos
+comprados
+| SHOW TABLES IN  | Las tablas de  | Localizar el  |       |
+| --------------- | -------------- | ------------- | ----- |
+|                 | sistema de     | script con    | find  |
+mysql LIKE
+|     | Spider no se  | /usr/share/mys |     |
+| --- | ------------- | -------------- | --- |
+'spider%'
+| devuelve vacío  | crearon        | ql* -name      |     |
+| --------------- | -------------- | -------------- | --- |
+| tras            | automáticament |                |     |
+| INSTALL         |                | "install_spide |     |
+e
+| SONAME |     | r.sql"  |     |
+| ------ | --- | ------- | --- |
+ y
+2>/dev/null
+ejecutar con
+sudo mariadb <
+ruta_del_scrip
+t.sql
+| El snapshot   | La VM no se     | Confirmar con    |       |
+| ------------- | --------------- | ---------------- | ----- |
+| fase14-       | apagó           | VBoxManage       |       |
+| completa  de  | correctamente   | list             |       |
+| nodo falla  | antes de tomar  | runningvms       |  si  |
+| porque la VM  | el snapshot     | aparece apagar  |       |
+| está en       |                 | con  VBoxManage  |       |
+| ejecución     |                 | controlvm        |       |
+"bdd-nodo06"
+acpipowerbutto
+n  y esperar 
+segundos antes
+de reintentar
+H. Checklist de validación
+spider_user@'192.168.56.106'  existe con  SELECT, INSERT, UPDATE, DELETE ON
+lab_bdd.*
+en nodo04 y en nodo05 (verificado con  ).
+SHOW GRANTS
+ existe en nodo04 con exactamente 10 filas y columnas
+v_productos_basico
+id, sku, nombre, categoria, precio, stock, fecha_creacion . Sin columnas TEXT de
+detalle.
+ existe en nodo05 con exactamente 10 filas y columnas
+v_productos_detalle
+id, sku, descripcion, ficha_tecnica, imagen_url, peso_kg . Sin columnas
+operacionales.
+44
+
+Las verificaciones de correctitud del paso E.5 devuelven  OK  (completitud y disjunción
+de columnas) en ambos nodos.
+bdd-nodo06  responde en  192.168.56.106  (verificado con  ip addr show ).
+| hostname                        |  en nodo06 devuelve  | bdd-nodo06 | .                        |
+| ------------------------------- | -------------------- | ---------- | ------------------------ |
+| SHOW VARIABLES LIKE 'server_id' |                      |            |  devuelve 6 en nodo06.   |
+| SHOW VARIABLES LIKE 'log_bin'   |                      |            |  devuelve OFF en nodo06. |
+| SHOW VARIABLES LIKE 'read_only' |                      |            |  devuelve OFF en nodo06. |
+SELECT PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME =
+'SPIDER'
+devuelve ACTIVE en nodo06.
+SHOW TABLES IN mysql LIKE 'spider%'  devuelve al menos 6 tablas de sistema en
+nodo06.
+SELECT * FROM mysql.servers  muestra exactamente 2 filas en nodo06:
+| srv_nodo04 |  (IP  .104 | ) y  srv_nodo05 |  (IP  .105 ). |
+| ---------- | ---------- | --------------- | ------------- |
+Conectividad verificada:  mysql -h 192.168.56.104 -u spider_user  desde nodo06
+| retorna  1 | .   |     |     |
+| ---------- | --- | --- | --- |
+Conectividad verificada:  mysql -h 192.168.56.105 -u spider_user  desde nodo06
+| retorna  1 | .   |     |     |
+| ---------- | --- | --- | --- |
+SELECT COUNT(*) FROM lab_bdd.clientes  en nodo06 devuelve 20.
+| SELECT COUNT(*) FROM lab_bdd.pedidos |     |     |  en nodo06 devuelve 20. |
+| ------------------------------------ | --- | --- | ----------------------- |
+SELECT COUNT(*) FROM lab_bdd.detalle_pedidos  en nodo06 devuelve el total correcto.
+SELECT COUNT(*) FROM lab_bdd.v_productos_basico  en nodo06 devuelve 10.
+SELECT COUNT(*) FROM lab_bdd.v_productos_detalle  en nodo06 devuelve 10.
+SELECT COUNT(*) FROM lab_bdd.productos  (VIEW) en nodo06 devuelve 10.
+La Consulta 6 (híbrida, E.15) devuelve 4 filas con facturación no nula.
+EXPLAIN SELECT * FROM clientes WHERE region = 'norte'  en nodo06 muestra solo
+frag_A .
+EXPLAIN SELECT * FROM clientes  sin filtro muestra  frag_A  y  frag_B  en nodo06.
+SHOW TABLES IN lab_bdd  en nodo06 devuelve exactamente 6 tablas + 2 VIEWs.
+Los snapshots  fase14-completa  existen en los 6 nodos del laboratorio.
+Puedo explicar sin ver el documento por qué  detalle_pedidos  usa dos tablas Spider
+simples + VIEW en lugar de una tabla Spider particionada por  .
+region
+Puedo describir el recorrido completo de la consulta
+SELECT * FROM productos WHERE
+  id = 5  desde nodo06: qué subconsultas genera Spider, a qué nodos las envía y cómo
+combina los resultados.
+45
+
+Puedo distinguir la transparencia de fragmentación (ocultar la división de datos) de
+la transparencia de ubicación (ocultar en qué nodo físico están los datos).
+Preguntas teóricas para estudiantes
+ La VIEW productos en nodo realiza un JOIN entre v_productos_basico (Spider →
+nodo)
+y v_productos_detalle (Spider → nodo) Analiza qué ocurre internamente en el
+coordinador
+cuando el cliente ejecuta SELECT nombre, descripcion FROM productos WHERE id = 3 :
+¿Spider
+puede empujar el predicado WHERE id = 3 hacia ambos nodos antes de traer los datos
+(predicate pushdown) o primero trae todas las filas de cada fragmento y luego filtra
+localmente? ¿Qué volumen de datos cruzaría la red en cada caso para una tabla de
+un millón
+de productos? Relaciona la respuesta con el concepto de eficiencia de JOIN distribuido
+ La tabla Spider clientes en nodo tiene PRIMARY KEY (id, region)  mientras que la
+tabla remota en nodo tiene PRIMARY KEY (id)  Explica por qué Spider permite esta
+discrepancia de definición de clave primaria Luego analiza si un cliente ejecuta
+INSERT INTO clientes (id, nombre, apellido, region, ...) VALUES (21, 'Ana',
+'López',
+'norte', ...) directamente en nodo ¿ese INSERT llega a nodo? ¿qué validaciones
+realiza Spider antes de reenviar la operación al shard remoto? ¿qué error recibirá si
+intenta insertar un cliente con region = 'centro' (valor no definido en las particiones)?
+ detalle_pedidos en nodo se implementó con dos tablas Spider simples más una
+VIEW UNION ALL  Un estudiante propone agregar la columna region directamente a
+detalle_pedidos en nodo y nodo (desnormalización) para poder usar
+PARTITION BY LIST COLUMNS (region) igual que clientes y pedidos  Evalúa esta
+propuesta ¿qué DDL habría que ejecutar en los shards? ¿qué mecanismo garantizaría
+que detalle_pedidos.region coincida siempre con pedidos.region sin FK de motor?
+y ¿qué gana el sistema en términos de rendimiento de poda si se adopta esta solución?
+ CREATE SERVER almacena la contraseña de spider_user en mysql.servers  visible para
+cualquier usuario con acceso SELECT a esa tabla en nodo Describe el vector de ataque
+concreto si un atacante obtiene acceso de solo lectura a mysql.servers  e identifica tres
+medidas de mitigación distintas —sin cambiar la arquitectura Spider— que reducirían ese
+riesgo Una de ellas debe involucrar los privilegios concedidos a spider_user en
+nodo y nodo otra debe ser a nivel del sistema operativo de nodo
+46
+
+ Clasifica los seis nodos del laboratorio según el teorema CAP justificando cada
+clasificación con argumentos técnicos concretos del diseño actual Por ejemplo ante una
+partición de red entre nodo y nodo mientras una consulta a la VIEW productos está
+en curso ¿el coordinador elige Consistencia (rechaza la consulta) o Disponibilidad
+(devuelve datos parciales de nodo)? ¿Y el par nodo-nodo en replicación asíncrona
+ante la caída de nodo antes de que un evento del binlog llegara a nodo?
+Ejercicios prácticos
+ Monitoreo del tráfico Spider entre coordinador y shards
+En nodo ejecutar sudo tcpdump -i enp0s8 -n port 3306 -c 100 en segundo plano
+mientras
+se ejecutan desde nodo las siguientes tres consultas en secuencia
+(a) SELECT precio FROM v_productos_basico WHERE id = 1 
+(b) SELECT descripcion FROM v_productos_detalle WHERE id = 1 
+© SELECT * FROM productos WHERE id = 1 (VIEW)
+Repetir el experimento con el tcpdump en nodo Para cada consulta registrar en qué
+nodo(s) aparece tráfico TCP Concluir ¿la consulta (a) activa solo nodo? ¿la consulta
+(b) activa solo nodo? ¿la VIEW de © activa ambos nodos incluso cuando el WHERE
+filtra una sola fila por id ? Documentar la salida del tcpdump con evidencia
+ Inserción coordinada de un nuevo producto y observación del estado intermedio
+Insertar manualmente el producto id = 11 en dos pasos separados
+(a) Ejecutar INSERT INTO lab_bdd.v_productos_basico (id, sku, nombre, ...)
+directamente
+en nodo Luego consultar SELECT COUNT(*) FROM productos desde nodo y observar
+qué devuelve la VIEW en estado intermedio (solo un fragmento insertado)
+(b) Ejecutar INSERT INTO lab_bdd.v_productos_detalle (id, sku, descripcion, ...)
+en nodo
+Consultar nuevamente SELECT * FROM productos WHERE id = 11 desde nodo y
+verificar que
+ahora devuelve la fila completa
+© Eliminar el producto de ambos fragmentos y confirmar que la VIEW vuelve a  filas
+Discutir ¿qué problema de consistencia expone el estado intermedio? ¿Cómo lo resolvería
+una transacción distribuida XA en un entorno de producción real?
+ Script de auditoría de sincronía entre fragmentos verticales
+Escribir un script Bash en nodo que conecte a nodo y a nodo con mysql -h IP
+-u spider_user y compare los conjuntos de id presentes en v_productos_basico y
+47
+
+en v_productos_detalle  El script debe imprimir [OK] Fragmentos sincronizados:
+N productos si los IDs coinciden o [FALLA] IDs solo en V_basico: X / solo en
+V_detalle: Y si difieren Ejecutarlo en condiciones normales luego insertar
+deliberadamente una fila solo en nodo para crear un desajuste confirmar que el
+script lo detecta eliminar la fila y verificar que el script vuelve a reportar OK 
+Reto adicional para alumnos avanzados
+Investigar y diseñar una solución para escritura distribuida transparente desde nodo06
+a través de la VIEW productos . La VIEW actual es de solo lectura porque MariaDB no sabe
+cómo descomponer automáticamente un INSERT INTO productos (...) en dos inserciones
+separadas hacia dos tablas Spider en dos nodos distintos.
+Implementar una de las dos soluciones siguientes y documentar el resultado completo:
+Opción A — Stored Procedure:
+Crear CALL insertar_producto(sku, nombre, categoria, precio, stock, descripcion,
+ficha_tecnica,
+imagen_url, peso_kg) en nodo06 que: (1) inserta las columnas operacionales en nodo04 via
+la tabla Spider v_productos_basico , captura el LAST_INSERT_ID() generado, y (2) inserta
+las columnas de detalle en nodo05 via v_productos_detalle usando ese mismo ID.
+Demostrar
+la llamada, verificar que el nuevo producto aparece en la VIEW productos , y discutir qué
+garantía de atomicidad ofrece este procedimiento ante la caída de nodo05 entre los pasos 1
+y 2.
+Opción B — Trigger sobre VIEW:
+Investigar si MariaDB soporta triggers INSTEAD OF sobre VIEWs (disponibles en SQLite y
+PostgreSQL, no en MySQL/MariaDB estándar). Si no es posible, demostrar ese límite con
+el error que produce intentar crear el trigger, explicar técnicamente por qué el motor no
+puede soportarlo sin cambios en la arquitectura, y proponer qué extensión de Spider o qué
+configuración de replicación permitiría escrituras bidireccionales transparentes desde nodo06.
+48
+
+Criterios de evaluación para el profesor
+| Criterio | Peso | Indicador de  |
+| -------- | ---- | ------------- |
+logro
+| Fragmentos     | % | v_productos_ba |
+| -------------- | --- | -------------- |
+| verticales en  |     | sico  y        |
+| nodo/nodo  |     | v_productos_de |
+talle  existen
+con las
+columnas
+correctas y 
+filas las
+verificaciones
+de completitud
+y disjunción
+devuelven  
+OK
+el estudiante
+relaciona las
+columnas con el
+criterio de
+afinidad del
+DDD (Fase )
+| Configuración  | % | nodo tiene IP  |
+| -------------- | --- | ---------------- |
+| de nodo      |     | .106            |
+| (MariaDB +     |     | server_id =      |
+| Spider)        |     |                 |
+6 log_bin =
+ Spider
+OFF
+ tablas
+ACTIVE
+
+spider_*
+presentes el
+estudiante
+puede mostrar
+SHOW
+VARIABLES  con
+los valores
+esperados y
+explicar por qué
+log_bin = OFF
+en el
+coordinador
+  %
+| CREATE SERVER   |     | mysql.servers    |
+| --------------- | --- | ---------------- |
+| y conectividad  |     | muestra los dos  |
+| Spider          |     | servidores la   |
+49
+
+prueba de
+conectividad
+TCP desde
+nodo pasa sin
+error el
+estudiante
+puede explicar
+la diferencia
+entre usar
+CREATE SERVER
+vs credenciales
+directas en el
+COMMENT y las
+implicaciones de
+seguridad de
+cada opción
+Tablas Spider % clientes y
+horizontales pedidos en
+y poda nodo
+devuelven 
+filas EXPLAIN
+confirma poda
+con filtro de
+región el
+estudiante
+justifica por qué
+detalle_pedido
+s requiere un
+diseño diferente
+y lo demuestra
+con la
+implementación
+de dos tablas
+Spider + VIEW
+Fragmentos % v_productos_ba
+verticales via sico y
+Spider y VIEW v_productos_de
+productos talle en
+nodo
+devuelven 
+filas VIEW
+productos
+devuelve 
+filas con todos
+los atributos el
+50
+
+estudiante
+puede describir
+el JOIN
+distribuido que
+ocurre
+internamente
+en Spider
+para resolver
+esa VIEW
+Consultas % Las  consultas
+distribuidas y de E
+transparencia producen
+resultados
+correctos la
+Consulta 
+(híbrida)
+devuelve  filas
+el estudiante
+puede explicar
+para cada
+consulta cuáles
+nodos activa
+Spider cuándo
+aplica poda y
+cuándo realiza
+UNION ALL
+Preparación para la siguiente fase
+La Fase 15: Fragmentación Híbrida requerirá:
+• bdd-nodo06 completamente operativo con Spider (esta fase) todas las tablas Spider
+y VIEWs funcionando conectividad verificada hacia nodo y nodo snapshots
+fase14-completa en los seis nodos
+• Comprensión clara de la diferencia de rendimiento entre acceso a un solo fragmento
+( v_productos_basico  solo nodo) versus JOIN distribuido (VIEW productos  nodo
+• nodo) establecida experimentalmente en las consultas de E
+• El Documento de Diseño Distribuido ( C:\LabBDD\Documentacion\fase09-disenyo-
+distribuido.md 
+sección D Consulta Distribuida ) como referencia técnica esa consulta híbrida es
+exactamente la Consulta  de esta fase ahora ejecutándose sobre la infraestructura real
+51
+
+En la Fase 15 se analizarán en profundidad las consultas que demuestran la fragmentación
+híbrida como propiedad emergente del diseño actual: el cliente conectado a nodo06 ejecutará
+SQL que accede simultáneamente a fragmentos horizontales (clientes y pedidos por
+región entre
+nodo04 y nodo05) y a fragmentos verticales (columnas de productos entre nodo04 y nodo05),
+todo coordinado por Spider sin que el cliente perciba la distribución. Se introducirán además
+estrategias de optimización: cuándo conviene filtrar antes del JOIN, cómo reducir el volumen
+de datos transferidos entre coordinador y shards, y qué índices en los shards mejoran el
+rendimiento de las subconsultas generadas por Spider.
+52
+
+---
+
+# Fase 15 — Fragmentación Híbrida
+
+Fase 15 — Fragmentación Híbrida
+Materia BDD
+Continuación directa de la Fase 14. Los seis nodos del laboratorio tienen sus snapshots
+fase14-completa tomados. En esta fase no se crean nuevas máquinas virtuales ni se
+redistribuyen datos: el objetivo es analizar, demostrar y optimizar la fragmentación
+híbrida como propiedad emergente de la arquitectura construida en las Fases 13 y 14.
+La combinación de fragmentación horizontal por región ( clientes , pedidos y
+detalle_pedidos repartidos entre nodo04 y nodo05) con fragmentación vertical por grupo
+de columnas ( v_productos_basico en nodo04 y v_productos_detalle en nodo05)
+constituye
+un escenario híbrido real: las consultas del cliente conectado a nodo06 pueden necesitar
+acceder a uno, dos o los cuatro “bloques de datos” distribuidos —dos horizontales y dos
+verticales— dependiendo de sus predicados y de qué columnas proyectan. Esta
+fase construye
+un catálogo de ocho consultas de localidad creciente (H-1 a H-8), introduce índices de
+optimización en los shards, demuestra el enrutamiento automático de escrituras y culmina
+con la creación de objetos de negocio —la vista reporte_pedidos_detallado y el
+procedimiento consulta_regional() — que encapsulan la distribución y verifican la
+transparencia completa ante el cliente final.
+A. Objetivos de aprendizaje
+Al finalizar esta fase, el estudiante será capaz de:
+ Definir formalmente la fragmentación híbrida inter-tabla y distinguirla de la
+fragmentación híbrida intra-tabla teórica aplicando ambas definiciones al esquema
+lab_bdd del laboratorio
+ Clasificar consultas según su grado de localidad distribuida —cuántos nodos físicos
+distintos accede Spider para resolverlas— y construir un catálogo de ocho consultas
+representativas con gradación de menor a mayor distribución
+ Crear índices compuestos de optimización en nodo y nodo para los patrones de
+JOIN más comunes y explicar cómo esos índices mejoran las subconsultas generadas
+internamente por Spider en cada shard remoto
+1
+
+ Demostrar el empuje de predicados (predicate pushdown) en tablas Spider
+particionadas ( clientes  pedidos ) y explicar por qué la VIEW detalle_pedidos
+(UNION ALL) no se beneficia del mismo mecanismo automáticamente
+ Aplicar la proyección de columnas como técnica de optimización vertical elegir
+v_productos_basico en lugar de la VIEW productos cuando las columnas TEXT de
+detalle no son necesarias evitando el acceso a nodo
+ Reescribir la consulta híbrida canónica del DDD (Consulta Distribuida  Fase )
+en versiones de menor grado de localidad y demostrar que producen resultados correctos
+con menor tráfico de red
+ Demostrar el enrutamiento automático de escrituras (INSERT UPDATE DELETE) a
+través del coordinador Spider hacia el shard correcto e identificar los casos de
+fan-out (escrituras sin predicado de región)
+ Construir la vista reporte_pedidos_detallado y el procedimiento almacenado
+consulta_regional() que encapsulan toda la complejidad distribuida y exponen una
+interfaz limpia al cliente de la aplicación
+ Verificar la transparencia completa de distribución —fragmentación ubicación y
+replicación— desde la perspectiva de un usuario final que solo conoce la IP de nodo
+ Cerrar la fase con el snapshot fase15-completa en los seis nodos del laboratorio
+B. Conceptos teóricos necesarios
+1. Fragmentación híbrida: taxonomía y aplicación al laboratorio.
+La fragmentación híbrida puede manifestarse de dos formas:
+• Intra-tabla la misma relación se fragmenta aplicando tanto una estrategia horizontal
+como una vertical Teóricamente productos podría dividirse por rangos de precio
+(horizontal) y también por grupos de columnas (vertical) dentro del mismo diseño MariaDB
+Spider no soporta este esquema en una sola definición de tabla
+• Inter-tabla distintas relaciones del mismo esquema usan estrategias de fragmentación
+diferentes Este es el caso del laboratorio clientes  pedidos y detalle_pedidos
+están fragmentadas horizontalmente por región mientras que productos está
+fragmentada verticalmente por grupo de columnas
+La hibridez emerge de combinar ambas estrategias en el mismo sistema, no en la misma tabla.
+Una consulta que une pedidos (horizontal) con productos (vertical) cruza, sin que el
+cliente lo perciba, los dos tipos de fragmentación simultáneamente.
+2
+
+2. Grado de localidad de una consulta distribuida.
+El grado de localidad mide cuántos nodos físicos distintos debe consultar Spider para resolver
+una consulta. Con dos nodos de sharding (nodo04 y nodo05), los posibles grados son:
+| Grado | Descripción | Nodos  |     |     |     |
+| ----- | ----------- | ------ | --- | --- | --- |
+accedidos
+|    | Un solo nodo  | Solo nodo o  |     |     |     |
+| --- | ------------- | -------------- | --- | --- | --- |
+|     | (máxima       | solo nodo    |     |     |     |
+localidad)
+| a  | Horizontal pura   | nodo +       |     |     |     |
+| --- | ----------------- | -------------- | --- | --- | --- |
+|     | (sin vertical)    | nodo para H  |     |     |     |
+| b  | Vertical pura     | nodo +       |     |     |     |
+|     | (sin horizontal)  | nodo para V  |     |     |     |
+|    | Híbrida total (H  | nodo +       |     |     |     |
+|     | + V)              | nodo para H  |     |     |     |
+y para V
+El grado 0 requiere dos condiciones simultáneas: filtro de región que cubra solo un shard
+(por ejemplo,  region IN ('norte','este') ) y no necesitar las columnas TEXT de
+|                     |  (es decir, usar  |                    |  directamente). |     |     |
+| ------------------- | ----------------- | ------------------ | --------------- | --- | --- |
+| v_productos_detalle |                   | v_productos_basico |                 |     |     |
+3. Descomposición interna de consultas por el motor Spider.
+Spider traduce cada  SELECT  del coordinador en subconsultas dirigidas a los shards remotos:
+• Para tablas Spider particionadas ( clientes   pedidos ) evalúa el  WHERE  para
+determinar qué particiones son relevantes genera una subconsulta por partición
+y recombina
+los resultados mediante UNION ALL implícito
+| • Para tablas Spider simples ( |     |                    |                    |     |    |
+| ------------------------------ | --- | ------------------ | ------------------- | --- | --- |
+|                                |     | v_productos_basico | v_productos_detalle |     |     |
+spider_detalle_nodo04   spider_detalle_nodo05 ) genera exactamente una subconsulta
+| dirigida al nodo configurado en el  |                 | COMMENT   |  del  CREATE TABLE                   |    |     |
+| ----------------------------------- | --------------- | --------- | ------------------------------------ | --- | --- |
+| • Para VIEWs (                      |                 |          | ) primero el optimizador de MariaDB |     |     |
+|                                     | detalle_pedidos | productos |                                      |     |     |
+expande la VIEW luego Spider procesa cada tabla Spider subyacente de
+forma independiente
+4. Empuje de predicados y sus límites en Spider VIEWs.
+3
+
+El predicate pushdown ocurre cuando Spider puede incluir en la subconsulta remota el
+predicado de la consulta exterior, reduciendo las filas transferidas por la red:
+• Funciona en tablas Spider particionadas WHERE region = 'norte' sobre clientes
+→ Spider envía SELECT ... WHERE region = 'norte' directamente a frag_A en nodo
+• Funciona en tablas Spider simples WHERE id = 5 sobre v_productos_basico → la
+subconsulta a nodo incluye WHERE id = 5 
+• No funciona automáticamente para la VIEW detalle_pedidos  al ser una VIEW definida
+como UNION ALL (spider_detalle_nodo04, spider_detalle_nodo05)  un predicado
+como
+WHERE pedido_id IN (...) que viene de un JOIN con pedidos no se empuja dentro del
+UNION ALL Spider descarga todas las filas de ambas tablas subyacentes y el coordinador
+filtra localmente La optimización manual consiste en reemplazar la VIEW por la tabla
+Spider directa ( spider_detalle_nodo04 o spider_detalle_nodo05 ) cuando se sabe qué
+shard contiene los datos relevantes
+5. Proyección de columnas como técnica de optimización vertical.
+Para la fragmentación vertical, las columnas proyectadas en el SELECT determinan qué
+nodo(s) accede Spider:
+• SELECT sku, nombre, precio FROM v_productos_basico → solo nodo (nunca toca
+nodo)
+• SELECT * FROM productos (VIEW JOIN) → nodo (basico) y nodo (detalle)
+Principio: si la consulta no necesita las columnas TEXT de detalle ( descripcion ,
+ficha_tecnica , imagen_url , peso_kg ), usar v_productos_basico directamente evita
+completamente el acceso a v_productos_detalle en nodo05. Esta es la optimización vertical
+más impactante disponible en el diseño actual.
+6. Índices en nodos remotos y su impacto en Spider.
+Spider envía la subconsulta al shard remoto y ese nodo la ejecuta usando su motor InnoDB
+local. Los índices en el shard afectan directamente la eficiencia de la subconsulta:
+• Sin índice en la columna de JOIN: el shard hace un full scan local antes de devolver las
+filas al coordinador
+• Con índice compuesto (region, cliente_id) en pedidos  el shard puede resolver el
+JOIN
+con clientes usando acceso por índice reduciendo las filas procesadas localmente
+4
+
+La creación de índices en los shards es completamente transparente para el cliente
+en nodo06;
+solo afecta al plan de ejecución interno de cada shard.
+7. Enrutamiento de escrituras a través del coordinador Spider.
+Para operaciones de escritura, Spider aplica la misma lógica de particionamiento:
+• INSERT: Spider evalúa el valor de la columna de partición ( region ) en la fila a
+insertar y dirige el INSERT al shard correspondiente Un INSERT sin valor de región
+producirá un error ya que Spider no puede determinar la partición destino
+• UPDATE/DELETE con predicado de región: Spider poda y envía la operación únicamente
+al shard relevante (targeted write) Ejemplo UPDATE ... WHERE region = 'norte' →
+solo nodo
+• UPDATE/DELETE sin predicado de región (fan-out): Spider puede necesitar buscar la
+fila en ambos shards Primero localiza en cuál está la fila luego ejecuta la
+modificación Este patrón genera el doble de tráfico de red y debe evitarse en consultas
+frecuentes
+• INSERT/UPDATE en tablas Spider simples ( v_productos_basico  v_productos_detalle )
+siempre se dirigen al nodo configurado en el COMMENT  no hay particionamiento
+8. Transparencia de distribución completa.
+Al finalizar la Fase 15, el laboratorio implementa tres de los cuatro tipos de transparencia
+definidos en la Fase 0:
+5
+
+| Tipo          | Mecanismo   | Estado        |
+| ------------- | ----------- | ------------- |
+| Fragmentación | El cliente  | Implementada  |
+|               | consulta    | desde Fase  |
+clientes 
+|     | productos  etc  |     |
+| --- | ----------------- | --- |
+sin saber que
+los datos están
+divididos
+| Ubicación | El cliente       | Implementada  |
+| --------- | ---------------- | ------------- |
+|           | siempre conecta  | desde Fase  |
+a
+192.168.56.10
+6  ignora
+nodo y
+nodo
+| Replicación | nodo–  | Implementada  |
+| ----------- | ---------- | ------------- |
+|             | replican   | desde Fase    |
+ entre  –
+lab_bdd
+sí de forma
+invisible para el
+cliente
+| Concurrencia | Control de  | Se aborda en  |
+| ------------ | ----------- | ------------- |
+|              | versiones   | Fase        |
+concurrentes
+pruebas de
+aislamiento
+6
+
+C. Prerrequisitos
+Estado requerido de las máquinas virtuales
+Nodo Snapshot Estado funcional
+esperado
+bdd-nodo04 fase14- SHARD-A:
+completa clientes (
+norte+este)
+pedidos ()
+detalle_pedido
+s (~)
+v_productos_ba
+sico ( filas)
+bind-
+address=0.0.0.
+0 
+server_id=4
+bdd-nodo05 fase14- SHARD-B:
+completa clientes (
+sur+oeste)
+pedidos ()
+detalle_pedido
+s (~)
+v_productos_de
+talle ( filas)
+bind-
+address=0.0.0.
+0 
+server_id=5
+bdd-nodo06 fase14- COORDINADOR:
+completa Spider ACTIVE 
+lab_bdd con
+tablas Spider
+( clientes 
+pedidos
+PARTITION LIST
+region
+spider_detalle
+_nodo04/05 
+v_productos_ba
+sico/detalle
+7
+
+simples) y
+VIEWs
+( detalle_pedid
+os UNION ALL
+productos
+JOIN)
+server_id=6 
+log_bin=OFF
+bdd-nodo01 , bdd-nodo02 y bdd-nodo03 permanecen apagados durante toda esta fase.
+No son necesarios para los ejercicios de fragmentación híbrida.
+Conocimiento técnico requerido
+• Particionamiento LIST COLUMNS y poda de particiones (Fase )
+• Fragmentación horizontal con predicados frag_A / frag_B y fragmentación derivada de
+detalle_pedidos (Fase )
+• Motor Spider CREATE SERVER  tablas Spider particionadas y simples VIEWs de
+reconstrucción (Fase )
+• El Documento de Diseño Distribuido C:\LabBDD\Documentacion\fase09-disenyo-
+distribuido.md 
+especialmente la Consulta Distribuida  de la sección D que es la consulta canónica
+híbrida que se analiza en profundidad en esta fase
+D. Procedimiento paso a paso
+Paso 1 — Iniciar nodo04, nodo05 y nodo06; verificar el estado heredado de la Fase 14
+(conteos de filas, bind-address , server_id , Spider ACTIVE , tablas y VIEWs existentes).
+Paso 2 — Revisar los índices actuales en nodo04 y nodo05 con
+information_schema.STATISTICS .
+Paso 3 — Crear índices compuestos de optimización en nodo04 y nodo05 para los
+patrones de
+JOIN más comunes en consultas híbridas.
+Paso 4 — Ejecutar el catálogo de ocho consultas híbridas desde nodo06 (H-1 a H-8),
+organizadas de menor a mayor grado de distribución.
+8
+
+Paso 5 — Analizar con EXPLAIN el impacto del predicate pushdown y la proyección de
+columnas en las particiones accedidas; comparar versiones optimizadas vs. no optimizadas.
+Paso 6 — Demostrar operaciones de escritura (INSERT, UPDATE, DELETE) a través del
+coordinador Spider, con verificación directa en los shards.
+Paso 7 — Crear la vista de negocio reporte_pedidos_detallado y el procedimiento
+almacenado consulta_regional() en nodo06.
+Paso 8 — Demostrar transparencia total: crear el usuario app_final en nodo06 y
+ejecutar consultas como si fuera una aplicación cliente sin conocimiento de la distribución.
+Paso 9 — Limpiar los datos de prueba insertados en el Paso 6.
+Paso 10 — Apagar los tres nodos activos y tomar el snapshot fase15-completa en los
+seis nodos del laboratorio.
+E. Comandos completos
+Los bloques (host) se ejecutan en PowerShell en Windows. Los bloques (VM — nodoXX)
+se ejecutan en una sesión SSH al nodo indicado. Los bloques SQL dentro de sudo mariadb
+se ejecutan en el prompt del motor MariaDB.
+E.1 Iniciar nodo04, nodo05 y nodo06; verificar el estado de la Fase
+14 (host)
+PowerShell
+VBoxManage startvm "bdd-nodo04" --type headless
+VBoxManage startvm "bdd-nodo05" --type headless
+VBoxManage startvm "bdd-nodo06" --type headless
+Start-Sleep -Seconds 35
+Abrir tres sesiones SSH simultáneas:
+9
+
+PowerShell
+ssh bddadmin@192.168.56.104 # Terminal 1 — nodo04
+ssh bddadmin@192.168.56.105 # Terminal 2 — nodo05
+ssh bddadmin@192.168.56.106 # Terminal 3 — nodo06
+Verificar el estado en nodo04:
+Bash
+sudo mariadb lab_bdd << 'EOF'
+SELECT 'clientes' AS tabla, COUNT(*) AS filas,
+GROUP_CONCAT(DISTINCT region ORDER BY region) AS regiones
+FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*), GROUP_CONCAT(DISTINCT region ORDER
+BY region)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*), NULL
+FROM detalle_pedidos
+UNION ALL
+SELECT 'v_productos_basico', COUNT(*), NULL
+FROM v_productos_basico;
+SHOW VARIABLES LIKE 'server_id';
+SHOW VARIABLES LIKE 'bind_address';
+EOF
+Salida esperada: 10 / 10 / ~18 / 10 filas; regiones solo este,norte ; server_id = 4 ;
+bind_address = 0.0.0.0 .
+Verificar en nodo05:
+10
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+SELECT 'clientes' AS tabla, COUNT(*) AS filas,
+GROUP_CONCAT(DISTINCT region ORDER BY region) AS regiones
+FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*), GROUP_CONCAT(DISTINCT region ORDER
+BY region)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*), NULL
+FROM detalle_pedidos
+UNION ALL
+SELECT 'v_productos_detalle', COUNT(*), NULL
+FROM v_productos_detalle;
+SHOW VARIABLES LIKE 'server_id';
+SHOW VARIABLES LIKE 'bind_address';
+EOF
+Salida esperada: 10 / 10 / ~18 / 10 filas; regiones solo oeste,sur ; server_id = 5 .
+Verificar el coordinador en nodo06:
+11
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Comprobar Spider activo
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.PLUGINS
+WHERE PLUGIN_NAME = 'SPIDER';
+-- Verificar objetos del esquema
+SELECT TABLE_NAME AS objeto, TABLE_TYPE AS tipo, ENGINE
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY TABLE_TYPE DESC, TABLE_NAME;
+-- Contar filas globales desde el coordinador
+SELECT 'clientes (Spider PARTITION)' AS fuente, COUNT(*) AS filas
+FROM clientes
+UNION ALL
+SELECT 'pedidos (Spider PARTITION)', COUNT(*)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos (VIEW UNION ALL)', COUNT(*)
+FROM detalle_pedidos
+UNION ALL
+SELECT 'v_productos_basico (Spider→nodo04)', COUNT(*)
+FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle (Spider→nodo05)', COUNT(*)
+FROM v_productos_detalle
+UNION ALL
+SELECT 'productos (VIEW JOIN distribuido)', COUNT(*)
+FROM productos;
+EOF
+Salida esperada: Spider ACTIVE ; 6 tablas + 2 VIEWs; conteos 20 / 20 / ~36 / 10 / 10 / 10.
+12
+
+E.2 Revisar índices actuales y crear índices de optimización en los shards
+E.2.1 Análisis de índices existentes (VM — nodo04)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Auditoría de índices actuales en todas las tablas del shard
+SELECT TABLE_NAME AS tabla,
+INDEX_NAME AS indice,
+SEQ_IN_INDEX AS posicion,
+COLUMN_NAME AS columna,
+NON_UNIQUE AS no_unico,
+NULLABLE AS nulable
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+EOF
+Los índices heredados de las Fases 13 y 14 son:
+13
+
+| Tabla | Índice | Columnas |
+| ----- | ------ | -------- |
+PRIMARY
+| clientes       |             | id         |
+| -------------- | ----------- | ---------- |
+| clientes       | uk_email    | email      |
+| clientes       | idx_region  | region     |
+| pedidos        | PRIMARY     | id         |
+| pedidos        | idx_cliente | cliente_id |
+| pedidos        | idx_region  | region     |
+| detalle_pedido | PRIMARY     | id         |
+s
+| detalle_pedido | idx_pedido | pedido_id |
+| -------------- | ---------- | --------- |
+s
+| detalle_pedido | idx_producto | producto_id |
+| -------------- | ------------ | ----------- |
+s
+| v_productos_ba | PRIMARY | id  |
+| -------------- | ------- | --- |
+sico
+| v_productos_ba | uq_sku | sku |
+| -------------- | ------ | --- |
+sico
+E.2.2 Crear índices compuestos de optimización en nodo04
+Los nuevos índices cubren los patrones de JOIN más comunes en consultas híbridas:
+14
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ── ÍNDICE 1 ──────────────────────────────────────────────
+-- Tabla: pedidos
+-- Columnas: (region, cliente_id)
+-- Patrón cubierto: consultas que filtran por región Y hacen JOIN a clientes.
+-- Sin este índice: el shard usa idx_region para la poda de región pero luego
+-- hace un full scan del fragmento para resolver el JOIN.
+ALTER TABLE pedidos
+ADD INDEX IF NOT EXISTS idx_region_cliente (region, cliente_id);
+-- ── ÍNDICE 2 ──────────────────────────────────────────────
+-- Tabla: clientes
+-- Columnas: (region, id)
+-- Patrón cubierto: consultas WHERE region IN (...) que necesitan id
+-- para el JOIN con pedidos. Permite index-only scan en muchos casos.
+ALTER TABLE clientes
+ADD INDEX IF NOT EXISTS idx_region_id (region, id);
+-- ── ÍNDICE 3 ──────────────────────────────────────────────
+-- Tabla: v_productos_basico
+-- Columnas: (categoria)
+-- Patrón cubierto: consultas GROUP BY o WHERE por categoría de producto
+-- (frecuentes en reportes de ventas por línea de negocio).
+ALTER TABLE v_productos_basico
+ADD INDEX IF NOT EXISTS idx_categoria (categoria);
+-- ── ÍNDICE 4 ──────────────────────────────────────────────
+-- Tabla: v_productos_basico
+-- Columnas: (precio)
+-- Patrón cubierto: filtros de rango por precio (búsquedas con
+-- BETWEEN o comparación de precio en el catálogo de productos).
+ALTER TABLE v_productos_basico
+ADD INDEX IF NOT EXISTS idx_precio (precio);
+-- Verificar los nuevos índices
+SELECT TABLE_NAME,
+INDEX_NAME,
+GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columnas,
+CASE WHEN NON_UNIQUE = 0 THEN 'ÚNICO' ELSE 'normal' END AS tipo
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+GROUP BY TABLE_NAME, INDEX_NAME
+ORDER BY TABLE_NAME, INDEX_NAME;
+EOF
+15
+
+E.2.3 Crear los mismos índices en nodo05
+Bash
+# En nodo05 — mismos índices para las tablas horizontales equivalentes
+sudo mariadb lab_bdd << 'EOF'
+ALTER TABLE pedidos
+ADD INDEX IF NOT EXISTS idx_region_cliente (region, cliente_id);
+ALTER TABLE clientes
+ADD INDEX IF NOT EXISTS idx_region_id (region, id);
+-- v_productos_detalle no requiere índices de categoria/precio porque
+-- no contiene esas columnas; sus búsquedas son por id o sku.
+-- Verificar
+SELECT TABLE_NAME,
+INDEX_NAME,
+GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columnas
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+GROUP BY TABLE_NAME, INDEX_NAME
+ORDER BY TABLE_NAME, INDEX_NAME;
+EOF
+E.3 Catálogo de consultas híbridas desde nodo06 (H-1 a H-8)
+Ejecutar el bloque completo en nodo06. Cada consulta incluye un encabezado que describe
+los fragmentos accedidos y el grado de localidad.
+16
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- CATÁLOGO DE CONSULTAS HÍBRIDAS — Grado de localidad 0 a 2
+-- ==============================================================
+-- ─────────────────────────────────────────────────────────────
+-- H-1: GRADO 0 — Localidad máxima (solo nodo04)
+--
+-- Fragmentos accedidos:
+-- · clientes_frag_A (nodo04) — poda por WHERE region
+IN ('norte','este')
+-- · pedidos_frag_A (nodo04) — poda por partición frag_A
+-- · spider_detalle_nodo04 (nodo04) — tabla Spider directa (NO la VIEW)
+-- · v_productos_basico (nodo04) — Spider simple, siempre en nodo04
+--
+-- Clave de optimización: se usa spider_detalle_nodo04 DIRECTAMENTE
+-- para evitar que la VIEW detalle_pedidos (UNION ALL) acceda a nodo05.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-1: Grado 0 — Solo nodo04 (máxima localidad) ===' AS consulta;
+SELECT c.region,
+CONCAT(c.nombre, ' ', c.apellido) AS cliente,
+c.ciudad,
+p.id AS pedido_id,
+p.estado,
+vb.sku,
+vb.nombre AS producto,
+vb.categoria,
+vb.precio,
+dp.cantidad,
+dp.subtotal
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo04 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('norte', 'este')
+ORDER BY c.region, p.id;
+-- ─────────────────────────────────────────────────────────────
+-- H-2: GRADO 1a — Fragmentación horizontal pura (ambos shards)
+--
+-- Fragmentos accedidos:
+-- · clientes frag_A (nodo04) + frag_B (nodo05) — sin filtro de región
+-- · pedidos frag_A (nodo04) + frag_B (nodo05)
+-- Sin join a productos: no hay fragmentación vertical involucrada.
+-- ─────────────────────────────────────────────────────────────
+17
+
+SELECT '=== H-2: Grado 1a — Horizontal puro (nodo04+nodo05) ===' AS consulta;
+SELECT c.region,
+COUNT(DISTINCT c.id) AS clientes,
+COUNT(DISTINCT p.id) AS pedidos,
+ROUND(SUM(p.total), 2) AS facturacion_total,
+MIN(p.fecha_pedido) AS primer_pedido,
+MAX(p.fecha_pedido) AS ultimo_pedido
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+GROUP BY c.region
+ORDER BY facturacion_total DESC;
+-- ─────────────────────────────────────────────────────────────
+-- H-3: GRADO 1b — Fragmentación vertical pura (ambos shards)
+--
+-- Fragmentos accedidos:
+-- · v_productos_basico (nodo04) — columnas operacionales
+-- · v_productos_detalle (nodo05) — columnas de detalle TEXT
+-- Spider hace JOIN distribuido: basico(nodo04) ⋈ detalle(nodo05)
+-- No interviene ninguna tabla de clientes/pedidos.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-3: Grado 1b — Vertical puro, JOIN distribuido nodo04+nodo05
+===' AS consulta;
+SELECT pr.id,
+pr.sku,
+pr.nombre,
+pr.categoria,
+pr.precio,
+pr.stock,
+LEFT(pr.descripcion, 70) AS descripcion_preview,
+LEFT(pr.ficha_tecnica, 70) AS ficha_preview,
+pr.peso_kg
+FROM productos pr
+ORDER BY pr.categoria, pr.nombre;
+-- ─────────────────────────────────────────────────────────────
+-- H-4: GRADO 2 PARCIAL — Un shard horizontal + ambos verticales
+--
+-- Fragmentos accedidos:
+-- · clientes_frag_A (nodo04) — poda por WHERE region
+IN ('norte','este')
+-- · pedidos_frag_A (nodo04) — poda
+-- · detalle_pedidos VIEW (nodo04+nodo05) — UNION ALL, sin poda automática
+-- · v_productos_basico (nodo04) — columnas operacionales
+-- · v_productos_detalle (nodo05) — columnas TEXT (via VIEW productos)
+-- Nodos físicos: nodo04 (horizontal+basico) + nodo05 (detalle+vertical)
+-- ─────────────────────────────────────────────────────────────
+18
+
+SELECT '=== H-4: Grado 2 parcial — Un shard horizontal + ambos verticales
+===' AS consulta;
+SELECT c.region,
+CONCAT(c.nombre, ' ', c.apellido) AS cliente,
+p.id AS pedido_id,
+pr.nombre AS producto,
+pr.categoria,
+pr.precio,
+LEFT(pr.descripcion, 60) AS descripcion_preview,
+pr.peso_kg,
+dp.cantidad,
+dp.subtotal
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN productos pr ON pr.id = dp.producto_id
+WHERE c.region IN ('norte', 'este')
+ORDER BY p.id;
+-- ─────────────────────────────────────────────────────────────
+-- H-5: GRADO 2 PARCIAL — Ambos shards horizontales + un shard vertical
+--
+-- Fragmentos accedidos:
+-- · clientes (frag_A nodo04 + frag_B nodo05) — sin filtro de región
+-- · pedidos (frag_A nodo04 + frag_B nodo05)
+-- · detalle_pedidos VIEW (nodo04+nodo05)
+-- · v_productos_basico (nodo04 únicamente — NO la VIEW productos)
+-- Clave: al elegir v_productos_basico en lugar de productos,
+-- se evita el acceso adicional a v_productos_detalle en nodo05.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-5: Grado 2 parcial — Ambos horizontales + solo basico de nodo04
+===' AS consulta;
+SELECT c.region,
+vb.categoria,
+COUNT(DISTINCT c.id) AS clientes_activos,
+COUNT(DISTINCT p.id) AS pedidos,
+SUM(dp.cantidad) AS unidades_vendidas,
+ROUND(SUM(dp.subtotal), 2) AS facturacion
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+GROUP BY c.region, vb.categoria
+ORDER BY c.region, facturacion DESC;
+-- ─────────────────────────────────────────────────────────────
+-- H-6: GRADO 2 TOTAL — Distribución completa
+19
+
+-- Consulta Distribuida 4 del DDD (Fase 9, sección D.5)
+--
+-- Fragmentos accedidos: TODOS
+-- · clientes (frag_A + frag_B)
+-- · pedidos (frag_A + frag_B)
+-- · detalle_pedidos VIEW (nodo04 + nodo05)
+-- · v_productos_basico (nodo04)
+-- [categoría está en basico → no se necesita v_productos_detalle]
+--
+-- Esta es la consulta canónica de fragmentación híbrida del laboratorio.
+-- Fue verificada localmente en la Fase 9 y a través de Spider en la Fase 14.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-6: Grado 2 total — Consulta DDD Fase 9 (distribución completa)
+===' AS consulta;
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria
+ORDER BY vb.categoria SEPARATOR ', ')
+AS categorias_compradas,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion_total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+GROUP BY c.region
+ORDER BY facturacion_total DESC;
+-- Resultado esperado: 4 filas, una por región, con datos de facturación
+no nulos
+-- ─────────────────────────────────────────────────────────────
+-- H-7: GRADO 2 TOTAL — Reporte analítico híbrido avanzado
+--
+-- Fragmentos accedidos: TODOS, incluyendo v_productos_detalle en nodo05
+-- porque peso_kg es una columna TEXT/DECIMAL de v_productos_detalle.
+-- Es la consulta de mayor complejidad de distribución del laboratorio:
+-- requiere 4 bloques de datos, todos simultáneamente.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-7: Grado 2 total — Reporte analítico avanzado con ficha de
+producto ===' AS consulta;
+SELECT vb.nombre AS producto,
+vb.categoria,
+vb.precio AS precio_catalogo,
+20
+
+vd.peso_kg,
+LEFT(vd.descripcion, 80) AS descripcion_corta,
+COUNT(DISTINCT p.region) AS regiones_de_venta,
+GROUP_CONCAT(DISTINCT p.region
+ORDER BY p.region
+SEPARATOR ', ') AS lista_regiones,
+SUM(dp.cantidad) AS total_unidades,
+ROUND(SUM(dp.subtotal), 2) AS total_facturado,
+ROUND(AVG(dp.precio_unitario), 2) AS precio_promedio_venta
+FROM v_productos_basico vb
+JOIN v_productos_detalle vd ON vd.id = vb.id
+JOIN detalle_pedidos dp ON dp.producto_id = vb.id
+JOIN pedidos p ON p.id = dp.pedido_id
+GROUP BY vb.id, vb.nombre, vb.categoria, vb.precio,
+vd.peso_kg, vd.descripcion
+ORDER BY total_facturado DESC;
+-- ─────────────────────────────────────────────────────────────
+-- H-8: GRADO 0 OPTIMIZADO — Versión single-shard de H-6
+--
+-- Mismo patrón de negocio que H-6 (resumen por región) pero
+-- restringido a frag_A (norte+este) y usando spider_detalle_nodo04
+-- DIRECTAMENTE (no la VIEW UNION ALL) para evitar el acceso a nodo05.
+-- Toda la consulta corre en nodo04 únicamente.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== H-8: Grado 0 optimizado — Equivalente regional de H-6 (solo
+nodo04) ===' AS consulta;
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria
+ORDER BY vb.categoria SEPARATOR ', ')
+AS categorias_compradas,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion_total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo04 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('norte', 'este')
+GROUP BY c.region
+ORDER BY facturacion_total DESC;
+-- Resultado esperado: 2 filas (norte, este) — subconjunto correcto de H-6
+21
+
+-- Verificar que el resultado de H-8 coincide con las filas norte+este de H-6
+EOF
+22
+
+E.4 Estrategias de optimización: análisis con EXPLAIN (VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- ANÁLISIS DE PLANES DE EJECUCIÓN CON EXPLAIN
+-- Objetivo: demostrar el efecto del predicate pushdown y la
+-- proyección de columnas en las particiones accedidas por Spider
+-- ==============================================================
+-- ── EXPERIMENTO A: Poda en tablas Spider PARTICIONADAS ───────
+-- Sin filtro → Spider consulta ambas particiones (frag_A + frag_B)
+SELECT '-- A1: clientes SIN filtro — ambas particiones --' AS experimento;
+EXPLAIN SELECT id, nombre, region FROM clientes;
+-- Con filtro de una sola región → poda a frag_A (nodo04)
+SELECT '-- A2: clientes CON region=norte — solo frag_A --' AS experimento;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region = 'norte';
+-- Con IN sobre ambas regiones de un mismo shard → poda a frag_A
+SELECT '-- A3: clientes region IN norte,este — solo frag_A --'
+AS experimento;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region IN
+('norte', 'este');
+-- Con IN mezclando regiones de distintos shards → ambas particiones
+SELECT '-- A4: clientes region IN norte,sur — frag_A + frag_B --'
+AS experimento;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region IN
+('norte', 'sur');
+-- ── EXPERIMENTO B: Poda en pedidos (misma lógica) ───────────
+SELECT '-- B1: pedidos con region=sur — solo frag_B (nodo05) --'
+AS experimento;
+EXPLAIN SELECT id, total FROM pedidos WHERE region IN ('sur', 'oeste');
+SELECT '-- B2: pedidos sin filtro — ambas particiones --' AS experimento;
+EXPLAIN SELECT COUNT(*), SUM(total) FROM pedidos;
+-- ── EXPERIMENTO C: VIEW detalle_pedidos — SIN poda automática
+-- La VIEW UNION ALL no hace poda aunque el JOIN con pedidos
+-- restrinja efectivamente a un shard. Spider descarga ambas tablas
+-- subyacentes y el coordinador filtra por pedido_id localmente.
+SELECT '-- C1: detalle_pedidos VIEW — siempre accede a ambas tablas Spider --
+' AS experimento;
+EXPLAIN SELECT COUNT(*) FROM detalle_pedidos;
+-- Contraste: tablas Spider directas sí acceden a un solo nodo
+SELECT '-- C2: spider_detalle_nodo04 — solo nodo04 --' AS experimento;
+EXPLAIN SELECT COUNT(*) FROM spider_detalle_nodo04;
+SELECT '-- C3: spider_detalle_nodo05 — solo nodo05 --' AS experimento;
+EXPLAIN SELECT COUNT(*) FROM spider_detalle_nodo05;
+23
+
+-- ── EXPERIMENTO D: Proyección de columnas (vertical) ─────────
+-- VIEW productos = JOIN(basico, detalle): siempre accede a ambos nodos
+SELECT '-- D1: SELECT * FROM productos — JOIN distribuido (nodo04+nodo05) --'
+AS experimento;
+EXPLAIN SELECT id, nombre, descripcion FROM productos WHERE id = 1;
+-- v_productos_basico: solo nodo04, independientemente del filtro
+SELECT '-- D2: SELECT FROM v_productos_basico — solo nodo04 --'
+AS experimento;
+EXPLAIN SELECT id, nombre, precio FROM v_productos_basico WHERE id = 1;
+-- ── EXPERIMENTO E: Poda transitiva en JOINs ─────────────────
+-- ¿Al filtrar clientes por región, se poda también pedidos?
+SELECT '-- E1: JOIN clientes+pedidos con region=norte (poda en ambas tablas)
+--' AS experimento;
+EXPLAIN
+SELECT c.nombre, p.total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+WHERE c.region = 'norte';
+-- ── RESUMEN VISUAL DE PARTICIONES ACCEDIDAS ─────────────────
+SELECT '== RESUMEN: qué particiones accede cada elemento ==' AS resumen;
+SELECT 'clientes WHERE region=norte' AS elemento, 'frag_A (nodo04)'
+AS particiones
+UNION ALL
+SELECT 'clientes sin filtro', 'frag_A + frag_B'
+UNION ALL
+SELECT 'pedidos WHERE region IN(sur,oeste)', 'frag_B (nodo05)'
+UNION ALL
+SELECT 'detalle_pedidos (VIEW UNION ALL)', 'siempre nodo04
++ nodo05'
+UNION ALL
+SELECT 'spider_detalle_nodo04 (tabla directa)', 'solo nodo04'
+UNION ALL
+SELECT 'v_productos_basico (Spider simple)', 'solo nodo04'
+UNION ALL
+SELECT 'v_productos_detalle (Spider simple)', 'solo nodo05'
+UNION ALL
+SELECT 'productos (VIEW JOIN basico+detalle)', 'nodo04 + nodo05';
+EOF
+24
+
+E.5 Operaciones de escritura a través del coordinador Spider (VM
+— nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- ENRUTAMIENTO AUTOMÁTICO DE ESCRITURAS
+-- ==============================================================
+-- ── INSERT con region='norte' → Spider enruta a frag_A (nodo04) ──
+INSERT INTO clientes (nombre, apellido, email, telefono, region, ciudad)
+VALUES ('Escritura', 'FragA', 'escritura.fraga@lab.test',
+'5500000099', 'norte', 'Monterrey');
+SELECT 'Verificar INSERT region=norte desde nodo06' AS paso,
+id, nombre, apellido, region, ciudad
+FROM clientes
+WHERE email = 'escritura.fraga@lab.test';
+-- ── INSERT con region='sur' → Spider enruta a frag_B (nodo05) ───
+INSERT INTO clientes (nombre, apellido, email, telefono, region, ciudad)
+VALUES ('Escritura', 'FragB', 'escritura.fragb@lab.test',
+'5500000098', 'sur', 'Guadalajara');
+SELECT 'Verificar INSERT region=sur desde nodo06' AS paso,
+id, nombre, apellido, region, ciudad
+FROM clientes
+WHERE email = 'escritura.fragb@lab.test';
+-- ── Conteo post-inserción por región ─────────────────────────
+SELECT region, COUNT(*) AS clientes FROM clientes GROUP BY region ORDER
+BY region;
+-- Esperado: norte=6, sur=6, este=5, oeste=5 (los shards originales tenían
+-- distribución 5 por región; los INSERTs añaden 1 a norte y 1 a sur)
+-- ── INSERT en tabla Spider simple → siempre a nodo04 ─────────
+INSERT INTO v_productos_basico
+(id, sku, nombre, categoria, precio, stock, fecha_creacion)
+VALUES (11, 'SKU-PRUEBA-011', 'Producto de Prueba Fase15',
+'Prueba', 99.99, 5, NOW());
+SELECT 'Verificar INSERT en v_productos_basico (nodo04)' AS paso,
+id, sku, nombre, categoria, precio, stock
+FROM v_productos_basico
+WHERE id = 11;
+-- ── UPDATE con predicado de región (escritura dirigida) ──────
+-- Spider poda a frag_A (nodo04) porque region = 'norte'
+UPDATE clientes
+SET ciudad = 'San Pedro Garza García'
+WHERE email = 'escritura.fraga@lab.test'
+25
+
+AND region = 'norte';
+SELECT 'Verificar UPDATE dirigido (region=norte → solo nodo04)' AS paso,
+id, nombre, ciudad, region
+FROM clientes
+WHERE email = 'escritura.fraga@lab.test';
+-- ── UPDATE sin predicado de región (fan-out) ─────────────────
+-- Spider puede necesitar localizar la fila en ambos shards
+-- antes de ejecutar la actualización. Patrón a evitar en consultas
+-- de alta frecuencia.
+UPDATE clientes
+SET telefono = '5500000097'
+WHERE email = 'escritura.fragb@lab.test';
+SELECT 'Verificar UPDATE fan-out (sin predicado region)' AS paso,
+id, nombre, telefono, region
+FROM clientes
+WHERE email = 'escritura.fragb@lab.test';
+-- ── DELETE con predicado de región (eliminación dirigida) ────
+-- Solo accede a nodo04 (region='norte')
+DELETE FROM clientes
+WHERE email = 'escritura.fraga@lab.test'
+AND region = 'norte';
+SELECT 'Verificar DELETE dirigido (debe ser 0 filas)' AS paso,
+COUNT(*) AS debe_ser_cero
+FROM clientes
+WHERE email = 'escritura.fraga@lab.test';
+EOF
+Verificar desde los shards que los datos se distribuyeron correctamente:
+26
+
+Bash
+# Verificar que fragb está en nodo05
+mysql -h 192.168.56.105 \
+-u spider_user \
+-p'Spider_2025!' \
+lab_bdd \
+-e "SELECT 'nodo05' AS nodo, id, nombre, apellido, region, ciudad
+FROM clientes
+WHERE email LIKE 'escritura.%';" 2>/dev/null
+# Verificar que fraga fue eliminada de nodo04
+mysql -h 192.168.56.104 \
+-u spider_user \
+-p'Spider_2025!' \
+lab_bdd \
+-e "SELECT 'nodo04' AS nodo, COUNT(*) AS filas_escritura
+FROM clientes
+WHERE email LIKE 'escritura.%';" 2>/dev/null
+# Verificar producto de prueba en nodo04
+mysql -h 192.168.56.104 \
+-u spider_user \
+-p'Spider_2025!' \
+lab_bdd \
+-e "SELECT 'nodo04 v_productos_basico' AS nodo, id, sku, nombre
+FROM v_productos_basico
+WHERE id = 11;" 2>/dev/null
+27
+
+E.6 Crear vista de negocio y procedimiento almacenado en nodo06 (VM
+— nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- OBJETOS DE NEGOCIO: ENCAPSULACIÓN DE LA DISTRIBUCIÓN HÍBRIDA
+-- ==============================================================
+-- ── Vista reporte_pedidos_detallado ──────────────────────────
+-- Encapsula la fragmentación horizontal (clientes/pedidos/detalle)
+-- y la fragmentación vertical (v_productos_basico).
+-- El cliente consulta esta vista como si fuera una tabla local.
+-- Usa v_productos_basico (no la VIEW productos) para evitar el
+-- acceso innecesario a v_productos_detalle cuando solo se necesitan
+-- datos operacionales.
+CREATE OR REPLACE VIEW reporte_pedidos_detallado AS
+SELECT
+c.region,
+CONCAT(c.nombre, ' ', c.apellido) AS cliente,
+c.ciudad,
+c.email,
+p.id AS pedido_id,
+p.fecha_pedido,
+p.estado,
+p.total AS total_pedido,
+vb.sku,
+vb.nombre AS producto,
+vb.categoria,
+vb.precio AS precio_catalogo,
+dp.cantidad,
+dp.precio_unitario,
+dp.subtotal
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id;
+-- Verificar la vista
+SELECT 'Vista reporte_pedidos_detallado — 5 filas de muestra'
+AS verificacion;
+SELECT region, cliente, ciudad, pedido_id, estado, producto,
+categoria, subtotal
+FROM reporte_pedidos_detallado
+ORDER BY region, pedido_id
+28
+
+LIMIT 5;
+-- Verificar que cubre todas las regiones
+SELECT region, COUNT(*) AS lineas_de_detalle, ROUND(SUM(subtotal),2) AS total
+FROM reporte_pedidos_detallado
+GROUP BY region
+ORDER BY region;
+-- ── Procedimiento almacenado consulta_regional() ─────────────
+-- Parámetro NULL → todas las regiones (ambos shards horizontales)
+-- Parámetro valor → poda Spider al shard correcto (una sola región)
+-- Demuestra transparencia total: el llamador no sabe qué nodo se accede.
+DROP PROCEDURE IF EXISTS consulta_regional;
+DELIMITER //
+CREATE PROCEDURE consulta_regional(
+IN p_region ENUM('norte','sur','este','oeste')
+)
+COMMENT 'Resumen de ventas por región. Pasar NULL para todas las regiones.'
+BEGIN
+IF p_region IS NOT NULL THEN
+-- Con filtro: Spider poda horizontalmente al shard correcto.
+-- La consulta accede a UN SOLO nodo para los datos horizontales.
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+pedidos_totales,
+GROUP_CONCAT(DISTINCT vb.categoria
+ORDER BY vb.categoria SEPARATOR ', ')
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion,
+ROUND(SUM(dp.subtotal) / COUNT(DISTINCT p.id), 2)
+AS ticket_promedio
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region = p_region
+GROUP BY c.region;
+ELSE
+-- Sin filtro: Spider accede a todos los shards horizontales.
+-- Equivale a H-6 del catálogo.
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+29
+
+pedidos_totales,
+GROUP_CONCAT(DISTINCT vb.categoria
+ORDER BY vb.categoria SEPARATOR ', ')
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion,
+ROUND(SUM(dp.subtotal) / COUNT(DISTINCT p.id), 2)
+AS ticket_promedio
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+GROUP BY c.region
+ORDER BY facturacion DESC;
+END IF;
+END //
+DELIMITER ;
+-- Probar el procedimiento con distintos argumentos
+SELECT '--- CALL consulta_regional(NULL) — todas las regiones ---' AS demo;
+CALL consulta_regional(NULL);
+SELECT '--- CALL consulta_regional(norte) — Spider poda a frag_A nodo04 ---'
+AS demo;
+CALL consulta_regional('norte');
+SELECT '--- CALL consulta_regional(sur) — Spider poda a frag_B nodo05 ---'
+AS demo;
+CALL consulta_regional('sur');
+SELECT '--- CALL consulta_regional(este) ---' AS demo;
+CALL consulta_regional('este');
+-- Confirmar que todos los objetos existen
+SELECT TABLE_NAME AS objeto, TABLE_TYPE AS tipo, ENGINE
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY TABLE_TYPE DESC, TABLE_NAME;
+SELECT ROUTINE_NAME AS procedimiento, ROUTINE_TYPE, ROUTINE_COMMENT
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = 'lab_bdd';
+EOF
+30
+
+E.7 Demostración completa de transparencia de distribución (VM
+— nodo06)
+Bash
+# Crear el usuario de aplicación final en nodo06
+# Este usuario representa a un desarrollador o aplicación que:
+# 1. Solo conoce la IP de nodo06 (192.168.56.106)
+# 2. No sabe que existen nodo04 ni nodo05
+# 3. Solo puede usar las tablas y vistas de lab_bdd en nodo06
+sudo mariadb << 'EOF'
+CREATE USER IF NOT EXISTS 'app_final'@'192.168.56.1'
+IDENTIFIED BY 'AppFinal_2025!';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lab_bdd.* TO
+'app_final'@'192.168.56.1';
+GRANT EXECUTE ON lab_bdd.* TO
+'app_final'@'192.168.56.1';
+FLUSH PRIVILEGES;
+SHOW GRANTS FOR 'app_final'@'192.168.56.1';
+EOF
+Conectarse como app_final desde el host Windows (simula la aplicación cliente):
+PowerShell
+# Desde el host Windows — la aplicación solo conoce nodo06
+mysql -h 192.168.56.106 -u app_final -p'AppFinal_2025!' lab_bdd
+Dentro de la sesión como app_final , ejecutar las siguientes consultas de transparencia:
+31
+
+SQL
+-- ¿Qué ve el usuario de aplicación?
+SHOW TABLES;
+-- Debe ver: clientes, pedidos, spider_detalle_nodo04, spider_detalle_nodo05,
+-- v_productos_basico, v_productos_detalle y las VIEWs
+-- Consulta 1: conteo global (accede a 2 shards transparentemente)
+SELECT COUNT(*) AS total_clientes FROM clientes;
+-- Consulta 2: buscar clientes del norte (Spider poda automáticamente)
+SELECT id, nombre, apellido, ciudad
+FROM clientes
+WHERE region = 'norte'
+ORDER BY id;
+-- Consulta 3: ver catálogo de productos con ficha completa
+-- (JOIN distribuido nodo04+nodo05 transparente)
+SELECT id, sku, nombre, categoria, precio,
+LEFT(descripcion, 50) AS descripcion_preview,
+peso_kg
+FROM productos
+ORDER BY categoria, nombre;
+-- Consulta 4: reporte usando la vista de negocio
+SELECT region,
+COUNT(*) AS lineas_detalle,
+ROUND(SUM(subtotal), 2) AS total
+FROM reporte_pedidos_detallado
+GROUP BY region
+ORDER BY total DESC;
+-- Consulta 5: usar el procedimiento almacenado (todas las regiones)
+CALL consulta_regional(NULL);
+-- Consulta 6: procedimiento filtrado (solo este)
+CALL consulta_regional('este');
+-- Consulta 7: verificar que el usuario NO puede ver la
+infraestructura interna
+-- (no tiene acceso a mysql.servers ni a los shards directamente)
+SELECT * FROM mysql.servers;
+-- Error esperado: access denied (el usuario solo tiene permisos en lab_bdd)
+Desde nodo06 (sesión bddadmin), verificar que el usuario no puede ver los servidores:
+32
+
+Bash
+sudo mariadb << 'EOF'
+-- Confirmar que app_final tiene los privilegios esperados y nada más
+SHOW GRANTS FOR 'app_final'@'192.168.56.1';
+-- Confirmar que la tabla mysql.servers está protegida
+SELECT Server_name, Host, Db FROM mysql.servers;
+-- Esto solo lo puede ver root/bddadmin, no app_final
+EOF
+E.8 Limpiar datos de prueba y apagar los nodos (VM — nodo06 y host)
+Bash
+# En nodo06: eliminar datos de prueba de E.5
+sudo mariadb lab_bdd << 'EOF'
+-- Eliminar cliente de prueba que quedó en nodo05 (fragb)
+DELETE FROM clientes WHERE email = 'escritura.fragb@lab.test';
+-- Eliminar producto de prueba en nodo04
+DELETE FROM v_productos_basico WHERE id = 11;
+-- Verificar limpieza
+SELECT 'clientes post-limpieza' AS verificacion, COUNT(*) AS total
+FROM clientes;
+SELECT 'v_productos_basico post-limpieza' AS verificacion, COUNT(*) AS total
+FROM v_productos_basico;
+-- Conteo final: debe coincidir exactamente con el estado inicial de la
+Fase 14
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'v_productos_basico', COUNT(*) FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle',COUNT(*) FROM v_productos_detalle
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos;
+EOF
+33
+
+Apagar cada nodo desde sus sesiones SSH activas:
+Bash
+# En la sesión SSH de nodo06
+sudo poweroff
+# En la sesión SSH de nodo05
+sudo poweroff
+# En la sesión SSH de nodo04
+sudo poweroff
+Confirmar desde el host:
+PowerShell
+Start-Sleep -Seconds 30
+VBoxManage list runningvms
+# La salida debe estar vacía
+Tomar los snapshots en los seis nodos:
+34
+
+PowerShell
+VBoxManage snapshot "bdd-nodo01" take "fase15-completa" `
+--description "Sin cambios en Fase 15. nodo01 apagado durante toda la fase.
+Snapshot de hito."
+VBoxManage snapshot "bdd-nodo02" take "fase15-completa" `
+--description "Sin cambios en Fase 15. nodo02 apagado durante toda la fase.
+Snapshot de hito."
+VBoxManage snapshot "bdd-nodo03" take "fase15-completa" `
+--description "Sin cambios en Fase 15. nodo03 apagado durante toda la fase.
+Snapshot de hito."
+VBoxManage snapshot "bdd-nodo04" take "fase15-completa" `
+--description "SHARD-A: 4 indices nuevos (idx_region_cliente, idx_region_id,
+idx_categoria, idx_precio). Datos verificados con catálogo H-1 a H-8. Escrituras
+enrutadas desde nodo06. Datos limpios post-fase."
+VBoxManage snapshot "bdd-nodo05" take "fase15-completa" `
+--description "SHARD-B: 2 indices nuevos (idx_region_cliente, idx_region_id).
+Datos verificados con catálogo híbrido. Datos limpios post-fase."
+VBoxManage snapshot "bdd-nodo06" take "fase15-completa" `
+--description "COORDINADOR: VIEW reporte_pedidos_detallado creada. PROCEDURE
+consulta_regional() creado. Usuario app_final para transparencia. Catálogo H-1 a
+H-8 verificado. EXPLAIN demuestra predicate pushdown."
+Confirmar la lista de snapshots:
+PowerShell
+VBoxManage snapshot "bdd-nodo04" list
+VBoxManage snapshot "bdd-nodo05" list
+VBoxManage snapshot "bdd-nodo06" list
+nodo04 y nodo05 deben mostrar desde fase05-completa hasta fase15-completa . nodo06
+muestra desde fase14-completa hasta fase15-completa .
+F. Verificación de funcionamiento
+Esta fase se considera completa cuando se cumplen todos los puntos siguientes:
+35
+
+ SHOW INDEX FROM pedidos  en nodo muestra los índices  idx_region_cliente
+(columnas  region, cliente_id ) e  idx_region_id  en  clientes  (columnas  region,
+id )
+|  Los mismos índices              |                                                    |                    |  e                              |               |  existen en nodo |     |
+| ---------------------------------- | -------------------------------------------------- | ------------------ | ------------------------------- | ------------- | ------------------- | --- |
+|                                    |                                                    | idx_region_cliente |                                 | idx_region_id |                     |     |
+|                                  |                                                    |                    |  en nodo muestra los índices  |               |                     |     |
+| SHOW INDEX FROM v_productos_basico |                                                    |                    |                                 |               | idx_categoria       |     |
+| y  idx_precio                      |  además de los existentes de las fases anteriores |                    |                                 |               |                     |     |
+ La consulta H- (solo nodo) devuelve exclusivamente filas con regiones  norte  y
+|  y ninguna fila de  |     |  u  |      |     |     |     |
+| ------------------- | --- | --- | ----- | --- | --- | --- |
+| este                |     | sur | oeste |     |     |     |
+ La consulta H- devuelve  filas (una por región) con datos de facturación no nulos
+ La consulta H- devuelve  filas con las columnas de basico y detalle combinadas
+| ( nombre |   descripcion |   peso_kg | )  |     |     |     |
+| -------- | -------------- | ---------- | --- | --- | --- | --- |
+ La consulta H- devuelve exactamente  filas con las cuatro regiones y datos de
+| categorias_compradas |     |  y  facturacion_total |     |  no nulos |     |     |
+| -------------------- | --- | --------------------- | --- | ---------- | --- | --- |
+ La consulta H- devuelve  filas ( norte  y  este ) cuyos valores de  facturacion_total
+coinciden exactamente con los de las mismas filas en H-
+|   |     |     |     |     |  muestra  |     |
+| --- | --- | --- | --- | --- | --------- | --- |
+EXPLAIN SELECT id, nombre FROM clientes WHERE region = 'norte'
+partitions:
+| frag_A |  únicamente (poda activa a nodo) |     |     |     |     |     |
+| ------ | ----------------------------------- | --- | --- | --- | --- | --- |
+ EXPLAIN SELECT id, nombre FROM clientes  sin filtro muestra  partitions:
+| frag_A,frag_B |    |     |     |     |     |     |
+| ------------- | --- | --- | --- | --- | --- | --- |
+ EXPLAIN SELECT COUNT(*) FROM detalle_pedidos  no muestra poda de partición (accede
+a
+ambas tablas subyacentes del UNION ALL)
+ EXPLAIN SELECT id, nombre FROM v_productos_basico WHERE id = 1  muestra acceso a
+un
+solo nodo (no aplica partición tabla Spider simple)
+ El INSERT con  region='norte'  desde nodo aparece en nodo al verificar
+directamente
+| con  |     |     |     |    |     |     |
+| ---- | --- | --- | --- | --- | --- | --- |
+mysql -h 192.168.56.104 -u spider_user
+ El INSERT con   desde nodo aparece en nodo al verificar directamente
+region='sur'
+| con  mysql -h 192.168.56.105 -u spider_user |     |     |     |    |     |     |
+| ------------------------------------------- | --- | --- | --- | --- | --- | --- |
+ El UPDATE con predicado de región se aplica solo al shard correcto (verificado en el
+shard remoto)
+ La DELETE con predicado de región elimina la fila únicamente del shard correspondiente
+|  La VIEW         |                           |                                           |  existe en  |                           |     |  con |
+| ------------------- | ------------------------- | ----------------------------------------- | ----------- | ------------------------- | --- | ---- |
+|                     | reporte_pedidos_detallado |                                           |             | information_schema.TABLES |     |      |
+| TABLE_TYPE = 'VIEW' |                           |  y devuelve filas de las cuatro regiones |             |                           |     |      |
+36
+
+ CALL consulta_regional(NULL) devuelve  filas con datos de todas las regiones
+ CALL consulta_regional('norte') devuelve exactamente  fila (solo la región norte)
+ CALL consulta_regional('sur') devuelve exactamente  fila (solo la región sur)
+ El usuario app_final puede ejecutar SELECT COUNT(*) FROM clientes desde nodo y
+obtiene el resultado correcto ( filas totales)
+ El usuario app_final no puede ejecutar SELECT * FROM mysql.servers (error de
+permisos esperado)
+ Después de la limpieza (E) SELECT COUNT(*) FROM clientes en nodo devuelve 
+y SELECT COUNT(*) FROM v_productos_basico devuelve 
+ Los snapshots fase15-completa existen en los seis nodos del laboratorio
+ El estudiante puede explicar de memoria la diferencia entre usar detalle_pedidos (VIEW)
+y spider_detalle_nodo04 (tabla Spider directa) y cuándo conviene cada enfoque
+37
+
+G. Problemas comunes y soluciones
+| Problema       | Causa probable  | Solución            |        |
+| -------------- | --------------- | ------------------- | ------ |
+| ALTER TABLE    | La versión de   | Usar                | ALTER  |
+| pedidos ADD    | MariaDB en uso  | TABLE pedidos       |        |
+| INDEX IF NOT   | no soporta      | IF  ADD INDEX       |        |
+| EXISTS  falla  | NOT EXISTS      |  en  idx_region_cli |        |
+| con error de   | ADD INDEX       | ente (region,       |        |
+| sintaxis       |                 |                     |        |
+cliente_id);
+sin
+IF NOT
+ si el
+EXISTS
+índice ya existe
+el motor
+devolverá un
+error 
+inofensivo que
+se puede
+ignorar
+| H- no produce  | Los datos de   | Verificar con       |     |
+| --------------- | -------------- | ------------------- | --- |
+| el mismo        | spider_detalle | SELECT              |     |
+| resultado que   | _nodo04        |  no  COUNT(*) FROM  |     |
+| las filas       | coinciden con  |                     |     |
+spider_detalle
+| norte+este de  | los de la VIEW  |     |  en  |
+| -------------- | --------------- | --- | ---- |
+_nodo04
+| H- | detalle_pedido   | nodo (debe      |     |
+| --- | ---------------- | ----------------- | --- |
+|     | s  filtrada por  | coincidir con la  |     |
+|     | pedidos de       | suma de           |     |
+|     | frag_A           | detalles de       |     |
+pedidos
+norte+este) si
+difiere revisar la
+carga de la Fase
+ desde el
+snapshot
+| EXPLAIN     |  no  El cliente  | Usar la sintaxis  |     |
+| ----------- | ---------------- | ----------------- | --- |
+| muestra la  | MySQL/MariaDB    | alternativa       |     |
+o la versión del
+columna  EXPLAIN
+motor omite la
+| partitions |     | PARTITIONS  |     |
+| ---------- | --- | ----------- | --- |
+columna en la
+| para las tablas  |        | SELECT ... |    |
+| ---------------- | ------ | ---------- | --- |
+| Spider           | salida |            |     |
+también se
+puede inferir la
+poda por los
+38
+
+patrones de
+rows  en la
+salida
+| INSERT desde  | Se intentó         |       | Verificar que el  |     |
+| ------------- | ------------------ | ----- | ----------------- | --- |
+| nodo falla  | insertar un valor  |       | valor de          |     |
+| con  ERROR    | de  region         |  que  | region            |     |
+| 1526: Table   | no existe en el    |       | pertenece al      |     |
+|               | dominio ENUM       |       | ENUM              |     |
+has no
+|     | de las  |     | ('norte','sur' |     |
+| --- | ------- | --- | -------------- | --- |
+partition for
+|     | particiones  |     | ,'este','oeste |     |
+| --- | ------------ | --- | -------------- | --- |
+value
+|     | Spider (por  |     | ')  si el       |     |
+| --- | ------------ | --- | ---------------- | --- |
+|     | ejemplo     |     | negocio          |     |
+|     | 'centro'     | )   | requiere nuevos  |     |
+valores ampliar
+el ENUM en los
+shards primero
+y luego agregar
+la partición en
+nodo
+| UPDATE sin        | Spider busca la  |     | Aumentar     |      |
+| ----------------- | ---------------- | --- | ------------ | ---- |
+| predicado de      | fila en ambos    |     | wait_timeout |      |
+| región falla con  | shards pero hay  |     | en nodo:   | SET  |
+| timeout           | latencia alta o  |     |              |      |
+GLOBAL
+conexión lenta
+wait_timeout =
+entre nodo y
+120; 
+los shards
+asegurarse de
+que los tres
+nodos estén
+corriendo
+verificar
+conectividad
+con
+ping
+192.168.56.10
+ desde
+4
+nodo
+| CALL             | Los datos de      |     | Verificar con   |     |
+| ---------------- | ----------------- | --- | --------------- | --- |
+| consulta_regio   | clientes con      |     | SELECT          |     |
+| nal('norte')     |   región=‘norte’  |     | COUNT(*) FROM   |     |
+| devuelve  filas | fueron            |     | clientes WHERE  |     |
+eliminados
+region='norte
+durante las
+'  en nodo
+pruebas o el
+si es  revisar
+procedimiento
+que las pruebas
+39
+
+|                  |     | se creó antes de  |     | de limpieza no    |     |
+| ---------------- | --- | ----------------- | --- | ----------------- | --- |
+|                  |     | que los datos     |     | eliminaron datos  |     |
+|                  |     | existieran        |     | válidos           |     |
+| La VIEW          |     | La VIEW usa       |     | Verificar con     |     |
+| reporte_pedido   |     | v_productos_ba    |     | SELECT            |     |
+| s_detallado      |     | sico  que en      |     | COUNT(*) FROM     |     |
+| devuelve  filas |     | nodo puede      |     | v_productos_ba    |     |
+|                  |     | haberse vaciado   |     |  en               |     |
+sico
+|     |     | si se limpió el  |     | nodo si es  |     |
+| --- | --- | ---------------- | --- | -------------- | --- |
+|     |     | id= también    |     | menor de    |     |
+|     |     | eliminó datos    |     | restaurar      |     |
+|     |     | anteriores (no   |     | nodo desde   |     |
+|     |     | debería DELETE  |     | fase14-        |     |
+WHERE id=
+completa
+es específico)
+| El usuario  |      | El host de    |     | Verificar la IP del  |     |
+| ----------- | ---- | ------------- | --- | -------------------- | --- |
+| app_final   |  no  | creación del  |     | adaptador            |     |
+|             |      | usuario es    |     | VirtualBox Host-     |     |
+puede
+Only con
+| conectarse     |     | '192.168.56.1    |     |                  |      |
+| -------------- | --- | ---------------- | --- | ---------------- | ---- |
+| desde el host  |     |  (IP del         |     |                  |  en  |
+|                |     | '                |     | ipconfig         |      |
+| Windows        |     | adaptador Host-  |     | Windows         |      |
+|                |     | Only del host    |     | ajustar el host  |      |
+|                |     | Windows) si la  |     | en el  CREATE    |      |
+|                |     | IP del host no   |     | USER  al valor   |      |
+|                |     | coincide la     |     | correcto         |      |
+conexión falla
+|     |     | El usuario  |     | Confirmar que  |     |
+| --- | --- | ----------- | --- | -------------- | --- |
+SELECT * FROM
+|     |     |   conectado tiene  |     | se está usando  |     |
+| --- | --- | ------------------ | --- | --------------- | --- |
+mysql.servers
+|     |     | privilegios sobre  |     | la sesión de  |     |
+| --- | --- | ------------------ | --- | ------------- | --- |
+devuelve
+| resultado vacío  |     | mysql.*   |  (no es  | app_final   |     |
+| ---------------- | --- | --------- | -------- | ----------- | --- |
+| (no error) en    |     | app_final | )        | ejecutando  |     |
+| nodo           |     |           |          | SELECT      |     |
+CURRENT_USER(
+|     |     |     |     | )  si es  | root  o  |
+| --- | --- | --- | --- | ---------- | -------- |
+|     |     |     |     | bddadmin   |  la     |
+restricción no
+aplica por
+diseño
+| Los snapshots      |     | Una de las VMs  |     | Esperar      |     |
+| ------------------ | --- | --------------- | --- | -------------- | --- |
+| fallan con “VM is  |     | no terminó de   |     | segundos       |     |
+| running”           |     | apagarse antes  |     | adicionales y  |     |
+|                    |     | del timeout     |     | verificar con  |     |
+VBoxManage
+list
+40
+
+runningvms  si
+persiste usar
+VBoxManage
+controlvm
+"bdd-nodo0X"
+acpipowerbutto
+n  y esperar
+| H- devuelve    | detalle_pedido | Verificar que la  |
+| --------------- | -------------- | ----------------- |
+| menos filas de  | s  VIEW puede  | consulta incluye  |
+las esperadas
+|     | no estar       | JOIN pedidos p    |
+| --- | -------------- | ----------------- |
+|     | uniendo        | ON                |
+|     | correctamente  | p.cliente_id =    |
+|     | con   en       |                   |
+|     | pedidos        | c.id  sin filtro  |
+el JOIN cuando
+adicional en
+hay filtro de
+pedidos  el
+región en
+filtro de región
+ pero  en
+|     | clientes | WHERE  |
+| --- | -------- | ------ |
+no en
+|     | pedidos | c.region IN  |
+| --- | ------- | ------------ |
+(...)  debe ser
+suficiente para
+restringir los
+pedidos por
+transititividad
+del JOIN
+H. Checklist de validación
+Los índices  idx_region_cliente  y  idx_region_id  existen en la tabla  pedidos  de
+nodo04 y nodo05.
+Los índices  idx_categoria  e  idx_precio  existen en  v_productos_basico  de nodo04.
+La consulta H-1 devuelve exclusivamente filas de las regiones  norte  y  este .
+La consulta H-2 devuelve 4 filas (una por región) con datos de facturación.
+La consulta H-3 devuelve 10 filas con columnas de  v_productos_basico  y
+| v_productos_detalle |  combinadas. |     |
+| ------------------- | ------------ | --- |
+La consulta H-6 devuelve exactamente 4 filas con  categorias_compradas  y
+ no nulos.
+facturacion_total
+La consulta H-8 devuelve 2 filas cuyos valores coinciden con las filas de H-6 para   y
+norte
+este .
+41
+
+EXPLAIN SELECT ... FROM clientes WHERE region = 'norte' muestra poda a frag_A
+únicamente.
+EXPLAIN SELECT ... FROM clientes sin filtro muestra frag_A,frag_B .
+EXPLAIN SELECT ... FROM detalle_pedidos NO muestra poda de partición (VIEW UNION
+ALL).
+El INSERT con region='norte' desde nodo06 fue verificado en nodo04 directamente.
+El INSERT con region='sur' desde nodo06 fue verificado en nodo05 directamente.
+El UPDATE con predicado de región se aplicó solo al shard correcto.
+El DELETE con predicado de región eliminó la fila solo del shard correspondiente.
+La VIEW reporte_pedidos_detallado existe y devuelve filas de las 4 regiones.
+CALL consulta_regional(NULL) devuelve 4 filas.
+CALL consulta_regional('norte') devuelve 1 fila.
+CALL consulta_regional('sur') devuelve 1 fila.
+El usuario app_final puede ejecutar SELECT COUNT(*) FROM clientes en nodo06.
+El usuario app_final NO puede ejecutar SELECT * FROM mysql.servers .
+Después de la limpieza: SELECT COUNT(*) FROM clientes = 20 en nodo06.
+Después de la limpieza: SELECT COUNT(*) FROM v_productos_basico = 10 en nodo06.
+Los snapshots fase15-completa existen en los seis nodos.
+Puedo explicar la diferencia entre usar la VIEW detalle_pedidos y
+spider_detalle_nodo04 directamente, y cuándo conviene cada opción.
+Puedo describir qué ocurre internamente en Spider ante un UPDATE sin predicado de
+región (fan-out).
+Puedo clasificar cualquier consulta dada en uno de los grados de localidad definidos en la
+Fase 15.
+Preguntas teóricas para estudiantes
+ En el catálogo de consultas H- a H- la consulta H- accede a nodo (para datos
+horizontales frag_A y v_productos_basico) y a nodo (solo para v_productos_detalle)
+mientras que H- accede únicamente a nodo Ambas filtran por region IN
+('norte','este') 
+Explica con precisión qué diferencia en las tablas referenciadas provoca que H- requiera
+nodo y H- no ¿Qué columna específica de qué tabla fuerza el acceso a nodo en
+42
+
+H-?
+¿Cómo podría reescribirse H- para eliminar ese acceso sin perder el resultado de negocio
+si la descripción no fuera necesaria?
+ En la demostración de escrituras (E) el UPDATE sin predicado de región se calificó como
+fan-out Describe en detalle el flujo de ejecución que Spider lleva a cabo internamente
+ante UPDATE clientes SET telefono = '...' WHERE email =
+'escritura.fragb@lab.test' : ¿cuántas
+subconsultas genera? ¿a qué nodos se envían? ¿en qué orden? ¿cómo determina Spider
+cuál shard contiene la fila antes de ejecutar la actualización? Propone una regla de
+diseño de aplicación que evite el fan-out en operaciones de escritura frecuentes
+ La VIEW detalle_pedidos se implementa como UNION ALL de dos tablas Spider simples
+en
+lugar de una tabla Spider particionada por región (como clientes o pedidos ) Ya se
+discutió que detalle_pedidos no tiene columna region  Un diseñador propone agregar
+una columna calculada region_pedido a detalle_pedidos en los shards (derivada del
+pedido_id vía la tabla pedidos ) para poder usar PARTITION BY LIST COLUMNS
+(region_pedido) en nodo Evalúa esta propuesta ¿qué DDL sería necesario en nodo
+y nodo? ¿qué mecanismo mantendría region_pedido sincronizado con
+pedidos.region
+sin FK de motor? ¿qué mejora de rendimiento produciría en la consulta H-
+ específicamente?
+y ¿qué riesgo de consistencia introduce?
+ La VIEW reporte_pedidos_detallado usa v_productos_basico directamente en lugar de
+la
+VIEW productos (JOIN basico+detalle) Esta decisión optimiza el acceso pero limita las
+columnas disponibles en el reporte Describe el proceso de decisión técnica completo que
+debería seguir un DBA para determinar si una vista de este tipo debe usar
+v_productos_basico
+o productos : ¿qué métricas de frecuencia de acceso a columnas consultaría? ¿qué
+impacto
+tiene en el tráfico de red entre coordinador y nodo? ¿cómo afecta al tiempo
+de respuesta
+si el % de las consultas a la vista no necesitan descripción ni ficha técnica?
+ El procedimiento consulta_regional('norte') logra Grado  de localidad para los datos
+horizontales (accede solo a nodo para clientes pedidos y detalles) pero
+v_productos_basico
+también está en nodo de modo que la consulta realmente accede a un solo nodo
+físico Sin
+embargo si el procedimiento necesitara incluir peso_kg del producto forzaría el acceso
+43
+
+a v_productos_detalle en nodo Clasifica las siguientes variantes del procedimiento
+según el grado de localidad que producen cuando p_region = 'norte' 
+(a) agregar vb.stock al SELECT sin cambiar el JOIN
+(b) agregar vd.peso_kg al SELECT con JOIN adicional a v_productos_detalle 
+© cambiar el WHERE a WHERE c.region IN ('norte','sur') 
+(d) eliminar el WHERE completamente
+Ejercicios prácticos
+ Catálogo extendido tres consultas propias con análisis de localidad
+Diseñar escribir y ejecutar tres consultas adicionales sobre el esquema distribuido
+de nodo que no estén en el catálogo H- a H- Para cada una (a) especificar qué
+fragmentos accede Spider (indicando nombre de tabla y nodo físico) (b) asignar el
+grado de localidad según la clasificación de la Fase  © ejecutar EXPLAIN y
+registrar la columna partitions y rows en la salida y (d) proponer una versión
+optimizada que reduzca el grado de localidad en al menos un nivel manteniendo la
+corrección del resultado Documentar la salida de EXPLAIN para la versión original
+y la optimizada
+ Benchmark comparativo VIEW detalle_pedidos vs tablas Spider directas
+Diseñar un experimento que mida y compare el rendimiento de las dos estrategias de
+acceso a detalle_pedidos desde nodo:
+(a) Usando la VIEW ( JOIN detalle_pedidos ON ... ) con filtro de región en clientes 
+(b) Usando la tabla Spider directa ( JOIN spider_detalle_nodo04 ON ... ) con el mismo
+filtro de región
+Para medir el rendimiento usar FLUSH STATUS; [CONSULTA]; SHOW STATUS LIKE
+'Handler_read%'; antes y después de cada consulta registrando el valor de
+Handler_read_rnd_next  Repetir cada consulta  veces calcular el promedio comparar
+y concluir ¿en qué porcentaje reduce el acceso directo a la tabla Spider el valor de
+Handler_read_rnd_next comparado con la VIEW? ¿Es la diferencia proporcional al número
+de filas en el shard que no se necesitan?
+ Ampliación del procedimiento parámetro de categoría de producto
+Modificar el procedimiento consulta_regional() para aceptar un segundo parámetro
+IN p_categoria VARCHAR(100)  Cuando p_categoria no es NULL la consulta debe
+filtrar también por la categoría del producto en v_productos_basico.categoria 
+Implementar
+las cuatro combinaciones (NULL NULL) (region NULL) (NULL categoria) y (region
+categoria) Para cada caso ejecutar EXPLAIN e identificar las particiones accedidas
+44
+
+Documentar si el filtro por categoría cambia el grado de localidad de la consulta y
+explicar por qué sí o no lo hace (pista categoría está en v_productos_basico  que
+siempre está en nodo ¿cómo afecta esto al grado de localidad cuando la región
+es NULL?)
+Reto adicional para alumnos avanzados
+Investigar e implementar un sistema de caché de resultados híbrida en nodo06 usando
+una tabla InnoDB local que almacene el resultado de la consulta H-6 (resumen por región)
+con una marca de tiempo de validez:
+SQL
+CREATE TABLE cache_resumen_regional (
+region ENUM('norte','sur','este','oeste') PRIMARY KEY,
+clientes INT,
+pedidos INT,
+categorias TEXT,
+facturacion DECIMAL(12,2),
+generado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+valido_hasta DATETIME
+) ENGINE = InnoDB;
+El reto consiste en: (1) crear un procedimiento refrescar_cache(p_ttl_minutos INT) que
+ejecute H-6 y cargue sus resultados en cache_resumen_regional con un TTL configurable
+en minutos; (2) crear un procedimiento consulta_con_cache(p_region ...) que devuelva el
+resultado de cache_resumen_regional si es válido (no ha expirado) o ejecute H-6 y refresque
+la caché si el TTL venció; (3) demostrar el comportamiento midiendo el tiempo de ejecución
+con TIMEDIFF(NOW(), t_inicio) para la primera llamada (caché vacía, H-6 real) y la segunda
+(caché válida, solo lectura local). Documentar el trade-off: ¿qué consistencia se pierde al
+usar caché? ¿Qué tipo de inconsistencia es posible si se insertan pedidos en los
+shards durante
+el TTL de la caché? ¿Cómo podría el sistema invalidar la caché ante una escritura, dado que
+Spider no tiene trigger inter-nodo?
+45
+
+Criterios de evaluación para el profesor
+| Criterio | Peso | Indicador de  |
+| -------- | ---- | ------------- |
+logro
+| Índices de       | % | Los cuatro       |
+| ---------------- | --- | ---------------- |
+| optimización en  |     | índices existen  |
+| shards           |     | en nodo y los  |
+dos en nodo
+el estudiante
+puede justificar
+el patrón de
+consulta que
+cubre cada
+índice y explicar
+por qué mejora
+el rendimiento
+de las
+subconsultas
+Spider
+| Catálogo de  | % | Las ocho         |
+| ------------ | --- | ---------------- |
+| consultas    |     | consultas H- a  |
+| híbridas     |     | H- devuelven    |
+resultados
+correctos y no
+vacíos el
+estudiante
+puede describir
+para cada una
+los fragmentos
+accedidos y
+asignar el grado
+de localidad
+correcto sin
+consultar el
+documento
+| Análisis     | % | El estudiante  |
+| ------------ | --- | -------------- |
+| EXPLAIN y    |     | demuestra con  |
+| optimización |     | evidencia de   |
+EXPLAIN que el
+predicate
+pushdown actúa
+en tablas Spider
+particionadas
+puede explicar
+46
+
+por qué la VIEW
+detalle_pedido
+s no se
+beneficia del
+mismo
+mecanismo y
+propone la
+alternativa
+correcta
+Operaciones de % Los INSERT se
+escritura verificaron en
+los shards
+correctos el
+estudiante
+puede describir
+el flujo de fan-
+out en UPDATE
+sin predicado de
+región y
+propone una
+regla de diseño
+para evitarlo
+Objetos de % reporte_pedido
+negocio (VIEW s_detallado y
+y SP)
+consulta_regio
+nal() existen y
+producen
+resultados
+correctos el
+estudiante
+puede explicar
+qué fragmentos
+accede cada
+objeto y por qué
+se eligió
+v_productos_ba
+sico en lugar
+de productos
+Demostración % El usuario
+de app_final
+transparencia ejecuta
+consultas
+correctas sin
+conocer la
+47
+
+distribución el
+estudiante
+articula los tres
+tipos de
+transparencia
+implementados
+(fragmentación
+ubicación
+replicación) con
+ejemplos
+concretos del
+laboratorio
+I. Preparación para la siguiente fase
+La Fase 16: Consultas Distribuidas requerirá:
+• Los snapshots fase15-completa en los seis nodos activos del laboratorio (completados
+en
+esta fase)
+• bdd-nodo06 con Spider activo los objetos creados en esta fase
+( reporte_pedidos_detallado 
+consulta_regional() ) y el usuario app_final operativo
+• La comprensión de los grados de localidad establecida en esta fase la Fase  presentará
+estrategias formales de descomposición de consultas globales en subconsultas la semijoin
+distribuida como técnica de optimización y el impacto del volumen de datos intermedios
+transferidos entre coordinador y shards
+• Los índices creados en nodo y nodo en esta fase que serán la base sobre la que la
+Fase  medirá el impacto de la optimización de consultas distribuidas
+En la Fase 16 se formalizará el proceso de descomposición de consultas distribuidas:
+dado un SQL global emitido en nodo06, se identificarán las subconsultas elementales
+que Spider
+genera internamente, se calcularán los volúmenes de datos intermedios transferidos por la red
+y se aplicarán técnicas de semijoin y filtrado temprano para reducir ese volumen. La Fase 16
+también introducirá el concepto de join distribuido con poda por índice: cómo una condición
+sobre un fragmento horizontal puede reducir el número de filas que Spider necesita recuperar
+del fragmento vertical, y viceversa.
+48
+
+49
+
+---
+
+# Fase 16 — Consultas Distribuidas
+
+Fase 16 — Consultas Distribuidas
+Materia BDD
+Continuación directa de la Fase 15. Los seis nodos del laboratorio tienen sus snapshots
+fase15-completa tomados: bdd-nodo01 - 03 conforman el clúster Galera con lab_bdd
+completo replicado, bdd-nodo04 y bdd-nodo05 son los shards con la fragmentación
+horizontal y vertical implementada, y bdd-nodo06 actúa como coordinador Spider con las
+tablas distribuidas, las VIEWs de reconstrucción, la vista reporte_pedidos_detallado y el
+procedimiento consulta_regional() creados en la Fase 15. En esta fase no se
+redistribuyen datos ni se modifica la arquitectura de fragmentación: el objetivo es
+formalizar el algoritmo de procesamiento de consultas distribuidas en sus cuatro fases
+clásicas, implementar manualmente la técnica de semijoin distribuida, medir el coste real
+de transferencia de datos con variables de estado de MariaDB, y provisionar bdd-nodo07
+( bdd-cliente )—la estación cliente externa que completa el mapa de nodos del laboratorio
+—como prueba final de transparencia de distribución. Al finalizar la fase, cualquier consulta
+de negocio sobre lab_bdd puede emitirse desde bdd-cliente hacia bdd-nodo06 sin que
+la aplicación cliente perciba que los datos residen en cuatro nodos físicamente separados.
+A. Objetivos de aprendizaje
+Al finalizar esta fase, el estudiante será capaz de:
+ Aplicar el algoritmo de procesamiento de consultas distribuidas de cuatro fases —
+descomposición localización optimización global y ejecución— sobre la consulta híbrida
+canónica del laboratorio identificando en qué fase ocurre cada transformación y qué
+subconsultas SQL representan cada etapa
+ Simular manualmente la fase de localización sustituir cada relación global por su
+expresión de fragmentos y aplicar predicados de simplificación para eliminar fragmentos
+vacíos antes de ejecutar ninguna subconsulta remota
+ Implementar la técnica de semijoin distribuida (algoritmo de Bernstein-Chiu) paso a paso
+comparando el volumen de datos transferidos entre el coordinador y los shards con y sin
+reducción y calculando el beneficio concreto para el esquema del laboratorio
+ Calcular el coste estimado de transferencia para distintos planes de ejecución usando
+information_schema.TABLES ( TABLE_ROWS y AVG_ROW_LENGTH ) y contrastar la estimación
+teórica con las métricas de ejecución real obtenidas de las variables Handler_read_* 
+1
+
+ Demostrar la poda por índice en subconsultas remotas ejecutar localmente en cada
+shard la subconsulta equivalente a la que Spider le enviaría y verificar con EXPLAIN que el
+plan local usa el índice compuesto correcto creado en la Fase 
+ Comparar la proyección temprana frente a SELECT *  cuantificar la reducción en bytes
+cuando Spider transmite solo las columnas necesarias en lugar del ancho completo de
+cada fila
+ Crear el procedimiento analizar_consulta() en bdd-nodo06 que dado un predicado de
+región y un indicador de necesidad de columnas de detalle calcula y muestra el plan de
+descomposición estimado con fragmentos involucrados filas esperadas bytes estimados y
+grado de localidad
+ Provisionar bdd-nodo07 ( bdd-cliente ) como estación cliente ligera —sin servidor
+MariaDB— con la IP 192.168.56.107  y configurarla para conectar exclusivamente a bdd-
+nodo06 usando las credenciales de app_final 
+ Verificar la transparencia completa de distribución —fragmentación ubicación y
+replicación— desde bdd-cliente ejecutando ocho pruebas que confirman que la
+aplicación cliente no puede distinguir un sistema distribuido de uno centralizado ni acceder
+a la infraestructura interna de los shards
+ Cerrar la fase con el snapshot fase16-completa en los siete nodos del laboratorio
+incluyendo el primer snapshot de bdd-nodo07 
+B. Conceptos teóricos necesarios
+1. Las cuatro fases del procesamiento de consultas distribuidas.
+El procesamiento de una consulta SQL en un sistema distribuido sigue un flujo de cuatro fases
+secuenciales (Özsu & Valduriez, Principles of Distributed Database Systems, 2011):
+2
+
+| Fase | Nombre | Qué pregunta  | Resultado |
+| ---- | ------ | ------------- | --------- |
+responde
+|    | Descomposició | ¿Cómo se         | Árbol algebraico  |
+| --- | ------------- | ---------------- | ----------------- |
+|     | n             | transforma el    | con selecciones   |
+|     |               | SQL en álgebra   | y proyecciones    |
+|     |               | relacional       | empujadas         |
+|     |               | optimizada?      | hacia las hojas   |
+|    | Localización  | ¿En qué          | Árbol con         |
+|     |               | fragmentos       | relaciones        |
+|     |               | residen los      | globales          |
+|     |               | datos de cada    | sustituidas por   |
+|     |               | relación global? | expresiones de    |
+fragmentos
+fragmentos
+vacíos
+eliminados
+|    | Optimización  | ¿En qué nodo se   | Plan de          |
+| --- | ------------- | ----------------- | ---------------- |
+|     | global        | ejecuta cada      | ejecución        |
+|     |               | operación?        | distribuido con  |
+|     |               | ¿Qué orden de     | asignación de    |
+|     |               | join minimiza el  | subconsultas a   |
+|     |               | coste de red?     | nodos            |
+|    | Ejecución     | ¿Cómo se          | Envío a nodos   |
+|     |               | despachan las     | recepción de     |
+|     |               | subconsultas y    | resultados       |
+|     |               | se ensambla el    | parciales       |
+|     |               | resultado?        | ensamblado en    |
+el coordinador
+Spider implementa automáticamente las fases 3 y 4. Esta fase simula manualmente las cuatro
+fases para hacer explícito el razonamiento interno del motor.
+2. Álgebra relacional distribuida: equivalencias de optimización.
+El optimizador usa equivalencias formales para reducir el coste sin cambiar el
+resultado semántico:
+| • Cascada de selecciones  |     |     |  — permite aplicar predicados de  |
+| -------------------------- | --- | --- | --------------------------------- |
+σ(p ∧ q)(R) = σ(p)(σ(q)(R))
+fragmentación de forma independiente antes de unir fragmentos
+• Conmutatividad selección-join  σ(p)(R ⋈ S) = σ(p_R)(R) ⋈ σ(p_S)(S)  cuando  p = p_R
+∧ p_S  — permite empujar predicados a cada fragmento antes del join
+3
+
+• Distributividad del join sobre la unión R ⋈ (S₁ ∪ S₂) = (R ⋈ S₁) ∪ (R ⋈ S₂) —
+permite hacer joins locales en cada shard antes de unir resultados
+• Proyección temprana π_A(R ⋈ S) = π_A(π_{A_R ∪ join_attrs}(R) ⋈ π_{A_S ∪
+join_attrs}(S)) — reduce el ancho de filas enviadas por la red
+3. Semijoin distribuida: definición formal y algoritmo.
+El semijoin de R con S se define como:
+Text
+R ⋉ S = {r ∈ R | ∃s ∈ S : r[attr_join] = s[attr_join]}
+En SQL: R ⋉ S ≡ SELECT * FROM R WHERE attr_join IN (SELECT attr_join FROM S) .
+El algoritmo clásico de Bernstein-Chiu (1981) para dos nodos N₁ (contiene R) y N₂ (contiene S)
+unidos por atributo a :
+Text
+Paso 1: S′ = π_a(S) → solo los IDs de join en N₂ (pequeño)
+Paso 2: Transferir S′ de N₂ a N₁
+Paso 3: R′ = R ⋉ S′ → filtrar R localmente en N₁ (solo
+filas coincidentes)
+Paso 4: Transferir R′ de N₁ a N₂
+Paso 5: Resultado = R′ ⋈ S → join completo en N₂ o en el coordinador
+El beneficio del semijoin es positivo cuando:
+Text
+size(S) > size(S′) + size(R′)
+Es decir, cuando el join tiene alta selectividad (pocos registros de R coinciden con S) o cuando
+S contiene muchas columnas que N₁ no necesita. Nota: Spider de MariaDB no aplica semijoin
+automáticamente; en esta fase se implementa manualmente para demostrar el concepto.
+4
+
+4. Estimación del coste de comunicación.
+El modelo de coste de transferencia simplificado (sin latencia) es:
+Text
+C_transfer(R) = |R| × AVG_ROW_LENGTH(R) [bytes]
+Ambos valores están disponibles en information_schema.TABLES tras ejecutar ANALYZE
+TABLE . En un entorno WAN, el coste de latencia domina; en la red virtual Host-Only del
+laboratorio, el ancho de banda es virtualmente ilimitado, por lo que se usa el volumen en bytes
+como proxy de coste comparativo.
+5. Poda por índice en subconsultas remotas.
+Cuando Spider envía una subconsulta a un shard, el motor InnoDB del shard la ejecuta con su
+propio optimizador y sus propios índices. Los índices compuestos creados en la Fase 15
+( idx_region_cliente , idx_region_id ) permiten al shard devolver al coordinador
+exactamente las filas necesarias, sin scans completos del fragmento:
+• Sin índice shard hace full scan del fragmento devuelve todas las filas el coordinador filtra
+• Con idx_region_id (region, id)  shard hace range scan por región devuelve solo las
+filas del predicado
+En tablas de volumen pequeño (10 filas en nuestro laboratorio), el optimizador InnoDB puede
+preferir el full scan; el principio se vuelve crítico con fragmentos de miles o millones de filas.
+6. Proyección temprana y reducción de ancho de columna.
+Spider empuja la lista de columnas del SELECT al shard. Si la consulta solo necesita id,
+nombre, region de clientes (~50 bytes/fila) en lugar de SELECT * (~120 bytes/fila), el
+shard devuelve al coordinador aproximadamente el 42% del volumen, independientemente del
+número de filas. La regla práctica: usar siempre listas de columnas explícitas en las VIEWs y
+procedimientos del coordinador.
+7. Variables de estado de MariaDB para análisis de consultas.
+Las variables Handler_* son contadores de sesión que se acumulan y se resetean con FLUSH
+STATUS :
+5
+
+Variable Descripción
+Handler_read_r Filas leídas en
+nd_next scans
+secuenciales
+(full table scan)
+Handler_read_k Lookups por
+ey índice (clave
+primaria o índice
+secundario)
+Handler_read_n Lecturas
+ext secuenciales
+tras un lookup
+por rango en
+índice
+Bytes_sent Bytes enviados
+al cliente en
+esta sesión
+Patrón de uso para comparar dos planes alternativos:
+Bash
+FLUSH STATUS;
+[CONSULTA A]
+SHOW STATUS WHERE Variable_name IN
+('Handler_read_rnd_next','Handler_read_key','Bytes_sent');
+FLUSH STATUS;
+[CONSULTA B]
+SHOW STATUS WHERE Variable_name IN
+('Handler_read_rnd_next','Handler_read_key','Bytes_sent');
+8. El cliente distribuido y la transparencia completa.
+bdd-cliente ( bdd-nodo07 , 192.168.56.107 ) representa cualquier aplicación —backend
+web, script de análisis, herramienta BI— que consume datos del sistema sin conocimiento de la
+distribución interna. Solo sabe la IP de bdd-nodo06 . Solo tiene instalado el cliente MariaDB. Al
+finalizar esta fase, el laboratorio implementa los tres primeros tipos de transparencia del
+catálogo de la Fase 0:
+6
+
+| Tipo          | Mecanismo         | Estado         |
+| ------------- | ----------------- | -------------- |
+| Fragmentación | El cliente        | Demostrado en  |
+|               | consulta          | Fases –   |
+|               | clientes         | verificado     |
+|               | productos  etc  | externamente   |
+|               | sin saber que     | en esta fase   |
+los datos están
+divididos
+| Ubicación   | El cliente solo  | Verificado     |
+| ----------- | ---------------- | -------------- |
+|             | conoce la IP de  | externamente   |
+|             | nodo           | en esta fase   |
+| Replicación | nodo–        | Implementado   |
+|             | replican         | en Fases – |
+ sin
+lab_bdd
+que el cliente lo
+perciba
+| Concurrencia | MVCC de          | Se aborda en  |
+| ------------ | ---------------- | ------------- |
+|              | InnoDB pruebas  | Fase        |
+de aislamiento
+7
+
+C. Prerrequisitos
+Estado requerido de las máquinas virtuales
+Nodo Snapshot Estado funcional
+esperado
+bdd-nodo01 fase15- MAESTRO
+completa Galera
+lab_bdd
+completo
+(///
+filas) binary
+log activo
+bdd-nodo02 fase15- Miembro Galera
+completa réplica
+completa
+read_only =
+OFF
+bdd-nodo03 fase15- Miembro Galera
+completa réplica completa
+bdd-nodo04 fase15- SHARD-A:
+completa clientes (
+norte+este)
+pedidos ()
+detalle_pedido
+s (~)
+productos (
+— se elimina en
+esta fase)
+v_productos_ba
+sico ()
+índices
+idx_region_cli
+ente 
+idx_region_id
+
+idx_categoria
+ idx_precio 
+server_id=4 
+bind-
+address=0.0.0.
+0
+8
+
+bdd-nodo05 fase15- SHARD-B:
+completa clientes (
+sur+oeste)
+pedidos ()
+detalle_pedido
+s (~)
+productos (
+— se elimina en
+esta fase)
+v_productos_de
+talle ()
+índices
+idx_region_cli
+ente 
+idx_region_id
+ server_id=5 
+bind-
+address=0.0.0.
+0
+bdd-nodo06 fase15- COORDINADOR
+completa Spider tablas
+Spider
+clientes 
+pedidos
+(PARTITION)
+spider_detalle
+_nodo04/05 
+v_productos_ba
+sico/detalle 
+VIEWs
+detalle_pedido
+s  productos 
+reporte_pedido
+s_detallado 
+PROCEDURE
+consulta_regio
+nal()  USER
+app_final 
+server_id=6
+bdd-nodo07 — No existe aún
+se crea en esta
+fase como bdd-
+cliente
+9
+
+bdd-nodo01 , bdd-nodo02 y bdd-nodo03 permanecen apagados durante los pasos de
+consultas distribuidas de esta fase. Solo bdd-nodo04 , bdd-nodo05 y bdd-nodo06
+necesitan estar activos. Se toman sus snapshots al final de la fase sin necesidad de
+encenderlos.
+Conocimiento técnico requerido
+• Catálogo de consultas H- a H- y grados de localidad (Fase )
+• Motor Spider CREATE SERVER  tablas Spider particionadas y simples VIEWs de
+reconstrucción (Fase )
+• Índices compuestos en los shards creados en la Fase 
+• Creación de clones enlazados de VirtualBox y reconfiguración de hostname e IP (Fases 
+y )
+D. Procedimiento paso a paso
+Paso 1 — Iniciar nodo04, nodo05 y nodo06; verificar el estado heredado de la Fase 15
+(conteos de filas, índices, tablas y VIEWs del coordinador).
+Paso 2 — Eliminar la tabla productos original de nodo04 y nodo05: fue cargada como
+solución temporal en la Fase 13; con v_productos_basico y v_productos_detalle
+implementando la fragmentación vertical definitiva, la tabla original es redundante y puede
+causar confusión.
+Paso 3 — Ejecutar el análisis estadístico de costes: ejecutar ANALYZE TABLE en todos los
+fragmentos y consultar information_schema.TABLES para construir la tabla de costes de
+transferencia estimados por fragmento.
+Paso 4 — Simular manualmente las cuatro fases de descomposición sobre la consulta
+canónica H-6: documentar cada fase en SQL ejecutable y verificar que la Fase 4 (ejecución
+manual) produce exactamente el mismo resultado que la consulta H-6 directa vía Spider.
+Paso 5 — Implementar la semijoin distribuida manual (algoritmo de Bernstein-Chiu) para el
+JOIN detalle_pedidos ⋈ v_productos_basico , midiendo con Handler_* el I/O de la
+estrategia naive frente a la estrategia con semijoin.
+10
+
+Paso 6 — Comparar proyección temprana vs. SELECT * : ejecutar la misma consulta con lista
+explícita de columnas y con SELECT * , midiendo Bytes_sent en cada caso.
+Paso 7 — Verificar la poda por índice conectando directamente a nodo04 y ejecutando las
+subconsultas que Spider enviaría, confirmando con EXPLAIN que el plan local usa el índice
+correcto.
+Paso 8 — Crear el procedimiento analizar_consulta() en nodo06: calcula el plan de
+descomposición estimado, los fragmentos accedidos, los bytes de transferencia y el grado de
+localidad para cualquier región y configuración de columnas.
+Paso 9 — Crear bdd-nodo07 ( bdd-cliente ) como clon enlazado de bdd-nodo01 desde el
+snapshot fase06-completa (Ubuntu Server + SSH, sin MariaDB instalado). Asignarle la IP
+192.168.56.107 y el hostname bdd-cliente .
+Paso 10 — Instalar mariadb-client en bdd-cliente , configurar /etc/hosts con todas las
+entradas del laboratorio y verificar la conectividad hacia bdd-nodo06 .
+Paso 11 — Ejecutar desde bdd-cliente las ocho pruebas de transparencia: el usuario
+app_final conectado únicamente a nodo06 ejecuta todas las operaciones de negocio sin
+conocimiento de la distribución interna, y se verifica que no puede acceder a la infraestructura
+de los shards.
+Paso 12 — Apagar todos los nodos activos y tomar el snapshot fase16-completa en los siete
+nodos del laboratorio.
+E. Comandos completos
+Los bloques (host) se ejecutan en PowerShell en Windows. Los bloques (VM — nodoXX) se
+ejecutan en una sesión SSH al nodo indicado. Los bloques SQL dentro de sudo mariadb se
+ejecutan en el prompt del motor.
+11
+
+E.1 Iniciar nodo04, nodo05 y nodo06; verificar el estado de la Fase 15 (host
++ VM)
+PowerShell
+VBoxManage startvm "bdd-nodo04" --type headless
+VBoxManage startvm "bdd-nodo05" --type headless
+VBoxManage startvm "bdd-nodo06" --type headless
+Start-Sleep -Seconds 35
+Conectarse a los tres nodos en terminales simultáneas:
+PowerShell
+ssh bddadmin@192.168.56.104 # Terminal 1 — nodo04
+ssh bddadmin@192.168.56.105 # Terminal 2 — nodo05
+ssh bddadmin@192.168.56.106 # Terminal 3 — nodo06
+Verificar el estado en nodo04:
+12
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Tablas y conteos
+SHOW TABLES;
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos
+UNION ALL
+SELECT 'v_productos_basico', COUNT(*)
+FROM v_productos_basico;
+-- Índices actuales
+SELECT TABLE_NAME,
+INDEX_NAME,
+GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ')
+AS columnas
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+GROUP BY TABLE_NAME, INDEX_NAME
+ORDER BY TABLE_NAME, INDEX_NAME;
+EOF
+sudo mariadb -e "SHOW VARIABLES LIKE 'server_id'; SHOW VARIABLES
+LIKE 'bind_address';"
+Verificar en nodo05 (mismas consultas, salida esperada con sur y oeste ):
+13
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+SHOW TABLES;
+SELECT 'clientes' AS tabla, COUNT(*) AS filas FROM clientes
+UNION ALL
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos', COUNT(*) FROM productos
+UNION ALL
+SELECT 'v_productos_detalle', COUNT(*)
+FROM v_productos_detalle;
+SELECT TABLE_NAME,
+INDEX_NAME,
+GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ')
+AS columnas
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+GROUP BY TABLE_NAME, INDEX_NAME
+ORDER BY TABLE_NAME, INDEX_NAME;
+EOF
+Verificar el coordinador en nodo06:
+14
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Objetos existentes en el coordinador
+SELECT TABLE_NAME AS objeto,
+TABLE_TYPE AS tipo,
+ENGINE
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY TABLE_TYPE DESC, TABLE_NAME;
+SELECT ROUTINE_NAME AS procedimiento, ROUTINE_TYPE
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = 'lab_bdd';
+-- Conteos globales desde el coordinador (prueba de conectividad Spider)
+SELECT 'clientes (Spider PARTITION)' AS fuente, COUNT(*) AS filas
+FROM clientes
+UNION ALL
+SELECT 'pedidos (Spider PARTITION)', COUNT(*)
+FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos (VIEW UNION ALL)', COUNT(*)
+FROM detalle_pedidos
+UNION ALL
+SELECT 'v_productos_basico (Spider→nodo04)', COUNT(*)
+FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle (Spider→nodo05)', COUNT(*)
+FROM v_productos_detalle
+UNION ALL
+SELECT 'productos (VIEW JOIN)', COUNT(*)
+FROM productos;
+-- Esperado: 20 / 20 / ~36 / 10 / 10 / 10
+EOF
+E.2 Eliminar la tabla productos original de los shards (VM — nodo04 y
+nodo05)
+La tabla productos fue cargada en los shards en la Fase 13 como catálogo temporal. Con la
+fragmentación vertical definitiva implementada en la Fase 14 ( v_productos_basico en
+nodo04, v_productos_detalle en nodo05), esa tabla ya no se necesita ni en nodo04 ni en
+nodo05.
+15
+
+En nodo04:
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Verificar que v_productos_basico tiene los mismos IDs que productos antes
+de eliminar
+SELECT 'productos (original)' AS tabla, COUNT(*) AS filas
+FROM productos
+UNION ALL
+SELECT 'v_productos_basico (frag)', COUNT(*) FROM v_productos_basico;
+-- Confirmar que no existen IDs en productos que no estén
+en v_productos_basico
+SELECT COUNT(*) AS ids_solo_en_productos_original
+FROM productos p
+LEFT JOIN v_productos_basico vb ON vb.id = p.id
+WHERE vb.id IS NULL;
+-- Debe devolver 0
+-- Eliminar la tabla temporal original del shard
+DROP TABLE IF EXISTS productos;
+-- Verificar que el shard tiene exactamente cuatro tablas definitivas
+SHOW TABLES;
+-- Debe mostrar: clientes, detalle_pedidos, pedidos, v_productos_basico
+EOF
+En nodo05:
+16
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+SELECT 'productos (original)' AS tabla, COUNT(*) AS filas
+FROM productos
+UNION ALL
+SELECT 'v_productos_detalle (frag)', COUNT(*) FROM v_productos_detalle;
+SELECT COUNT(*) AS ids_solo_en_productos_original
+FROM productos p
+LEFT JOIN v_productos_detalle vd ON vd.id = p.id
+WHERE vd.id IS NULL;
+-- Debe devolver 0
+DROP TABLE IF EXISTS productos;
+SHOW TABLES;
+-- Debe mostrar: clientes, detalle_pedidos, pedidos, v_productos_detalle
+EOF
+Verificar desde nodo06 que las tablas Spider y VIEWs del coordinador siguen funcionando tras
+el DROP en los shards:
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Las tablas Spider de nodo06 apuntan a v_productos_basico
+y v_productos_detalle,
+-- no a la tabla productos original → el DROP no las afecta
+SELECT 'v_productos_basico (Spider→nodo04)' AS fuente, COUNT(*) AS filas
+FROM v_productos_basico
+UNION ALL
+SELECT 'v_productos_detalle (Spider→nodo05)', COUNT(*)
+FROM v_productos_detalle
+UNION ALL
+SELECT 'productos (VIEW JOIN nodo04+nodo05)', COUNT(*)
+FROM productos;
+-- Resultado esperado: 10 / 10 / 10 — sin variación
+EOF
+17
+
+E.3 Análisis estadístico de costes de transferencia (VM — nodo04, nodo05
+y nodo06)
+Actualizar las estadísticas del optimizador para obtener valores precisos de TABLE_ROWS y
+AVG_ROW_LENGTH .
+En nodo04:
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Actualizar estadísticas
+ANALYZE TABLE clientes;
+ANALYZE TABLE pedidos;
+ANALYZE TABLE detalle_pedidos;
+ANALYZE TABLE v_productos_basico;
+-- Tabla de costes del fragmento A
+SELECT
+TABLE_NAME AS tabla,
+TABLE_ROWS AS filas,
+AVG_ROW_LENGTH AS
+bytes_por_fila,
+TABLE_ROWS * AVG_ROW_LENGTH AS
+bytes_totales_est,
+ROUND((TABLE_ROWS * AVG_ROW_LENGTH) / 1024.0, 2) AS total_KB_est,
+'bdd-nodo04 (frag_A)' AS ubicacion
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY bytes_totales_est DESC;
+EOF
+En nodo05:
+18
+
+Bash
+sudo mariadb lab_bdd << 'EOF'
+ANALYZE TABLE clientes;
+ANALYZE TABLE pedidos;
+ANALYZE TABLE detalle_pedidos;
+ANALYZE TABLE v_productos_detalle;
+SELECT
+TABLE_NAME AS tabla,
+TABLE_ROWS AS filas,
+AVG_ROW_LENGTH AS
+bytes_por_fila,
+TABLE_ROWS * AVG_ROW_LENGTH AS
+bytes_totales_est,
+ROUND((TABLE_ROWS * AVG_ROW_LENGTH) / 1024.0, 2) AS total_KB_est,
+'bdd-nodo05 (frag_B)' AS ubicacion
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'lab_bdd'
+ORDER BY bytes_totales_est DESC;
+EOF
+En nodo06, construir la tabla de costes consolidada del laboratorio:
+19
+
+Bash
+sudo mariadb << 'EOF'
+-- Tabla de referencia de costes por fragmento
+-- (los valores de bytes_por_fila son referencias; reemplazar con los reales
+de nodo04/05)
+SELECT
+fragmento,
+tabla_origen,
+nodo,
+ip,
+filas_aprox,
+bytes_por_fila,
+filas_aprox * bytes_por_fila AS
+bytes_transfer_max,
+ROUND(filas_aprox * bytes_por_fila / 1024.0, 1)
+AS KB_transfer_max,
+'= coste si Spider transfiere el fragmento completo' AS nota
+FROM (
+SELECT 'clientes_frag_A' AS fragmento,
+'clientes' AS tabla_origen,
+'bdd-nodo04' AS nodo,
+'192.168.56.104' AS ip,
+10 AS filas_aprox,
+120 AS bytes_por_fila
+UNION ALL SELECT 'pedidos_frag_A', 'pedidos', 'bdd-
+nodo04','192.168.56.104',10, 90
+UNION ALL SELECT 'detalle_frag_A', 'detalle_pedidos', 'bdd-
+nodo04','192.168.56.104',18, 60
+UNION ALL SELECT 'V_productos_basico', 'v_productos_basico','bdd-
+nodo04','192.168.56.104',10, 100
+UNION ALL SELECT 'clientes_frag_B', 'clientes', 'bdd-
+nodo05','192.168.56.105',10, 120
+UNION ALL SELECT 'pedidos_frag_B', 'pedidos', 'bdd-
+nodo05','192.168.56.105',10, 90
+UNION ALL SELECT 'detalle_frag_B', 'detalle_pedidos', 'bdd-
+nodo05','192.168.56.105',18, 60
+UNION ALL SELECT 'V_productos_detalle', 'v_productos_detalle','bdd-
+nodo05','192.168.56.105',10,150
+) AS costes
+ORDER BY nodo, bytes_transfer_max DESC;
+-- Coste máximo teórico si Spider transfiere TODOS los fragmentos
+SELECT 'Coste máximo total (todos los fragmentos, sin poda ni proyección)'
+AS escenario,
+ROUND((10*120 + 10*90 + 18*60 + 10*100 +
+20
+
+10*120 + 10*90 + 18*60 + 10*150) / 1024.0, 1)
+AS total_KB;
+-- Coste consulta H-1 (solo nodo04, con proyección y poda):
+SELECT 'Coste H-1 (grado 0, solo nodo04, norte+este)' AS escenario,
+ROUND((10*120 + 10*90 + 18*60 + 10*100) / 1024.0, 1)
+AS total_KB_H1;
+EOF
+21
+
+E.4 Simulación manual de las cuatro fases de descomposición (VM
+— nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- CONSULTA GLOBAL ORIGINAL (emitida por el cliente en nodo06):
+-- SELECT c.region, COUNT(DISTINCT c.id), COUNT(DISTINCT p.id),
+-- GROUP_CONCAT(DISTINCT vb.categoria), SUM(dp.subtotal)
+-- FROM clientes c
+-- JOIN pedidos p ON p.cliente_id = c.id
+-- JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+-- JOIN v_productos_basico vb ON vb.id = dp.producto_id
+-- GROUP BY c.region ORDER BY facturacion_total DESC;
+-- ==============================================================
+-- ─────────────────────────────────────────────────────────────
+-- FASE 1: DESCOMPOSICIÓN
+-- Transformaciones algebraicas aplicadas:
+-- 1. Proyección temprana: solo las columnas necesarias por tabla
+-- 2. Empuje de selecciones hacia las hojas
+-- 3. Reordenamiento del árbol de join (más selectivo primero)
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== FASE 1: Descomposición ===' AS fase_actual;
+SELECT c.region,
+c.id AS c_id,
+p.id AS p_id,
+dp.subtotal,
+dp.producto_id,
+vb.categoria
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+ORDER BY c.region
+LIMIT 6;
+-- ─────────────────────────────────────────────────────────────
+-- FASE 2: LOCALIZACIÓN
+-- Sustituir relaciones globales por expresiones de fragmentos.
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== FASE 2: Localización ===' AS fase_actual;
+-- Localización explícita de clientes
+22
+
+SELECT 'clientes localizado' AS rel_local,
+region,
+COUNT(*) AS filas
+FROM (
+SELECT region FROM clientes WHERE region IN ('norte','este')
+UNION ALL
+SELECT region FROM clientes WHERE region IN ('sur','oeste')
+) AS clientes_localizados
+GROUP BY region ORDER BY region;
+-- Simplificación con predicado: region='norte' elimina frag_B
+SELECT 'Simplificación con WHERE region=norte (frag_B vacío → eliminado)'
+AS demo;
+SELECT 'frag_A (norte+este)' AS fragmento,
+COUNT(*) AS filas_relevantes
+FROM clientes WHERE region IN ('norte','este')
+UNION ALL
+SELECT 'frag_B (sur+oeste) — ELIMINADO por predicado',
+COUNT(*) AS filas_relevantes_cero
+FROM clientes WHERE region IN ('sur','oeste') AND region = 'norte';
+-- ─────────────────────────────────────────────────────────────
+-- FASE 3: OPTIMIZACIÓN GLOBAL
+-- Sub-agregación por shard para reducir filas devueltas al coordinador
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== FASE 3: Optimización global (sub-agregación por shard) ==='
+AS fase_actual;
+-- Sub-resultado de frag_A (lo que Spider recibiría de nodo04):
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria ORDER BY vb.categoria)
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo04 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('norte', 'este')
+GROUP BY c.region;
+-- Sub-resultado de frag_B (lo que Spider recibiría de nodo05):
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+23
+
+COUNT(DISTINCT p.id) AS pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria ORDER BY vb.categoria)
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo05 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('sur', 'oeste')
+GROUP BY c.region;
+-- ─────────────────────────────────────────────────────────────
+-- FASE 4: EJECUCIÓN DISTRIBUIDA
+-- El coordinador recibe resultados parciales y ensambla el resultado final
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== FASE 4: Ejecución distribuida (ensamblado en el coordinador) ==='
+AS fase_actual;
+SELECT region,
+SUM(clientes_activos)
+AS clientes_activos,
+SUM(pedidos)
+AS pedidos,
+GROUP_CONCAT(DISTINCT categorias ORDER BY categorias SEPARATOR ', ')
+AS categorias,
+ROUND(SUM(facturacion), 2)
+AS facturacion_total
+FROM (
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria ORDER BY vb.categoria)
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo04 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('norte', 'este')
+GROUP BY c.region
+UNION ALL
+SELECT c.region,
+24
+
+COUNT(DISTINCT c.id),
+COUNT(DISTINCT p.id),
+GROUP_CONCAT(DISTINCT vb.categoria ORDER BY vb.categoria),
+ROUND(SUM(dp.subtotal), 2)
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN spider_detalle_nodo05 dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+WHERE c.region IN ('sur', 'oeste')
+GROUP BY c.region
+) AS resultados_parciales
+GROUP BY region
+ORDER BY facturacion_total DESC;
+-- ─────────────────────────────────────────────────────────────
+-- VERIFICACIÓN: el resultado de Fase 4 debe ser idéntico a H-6 directa
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== Referencia: consulta H-6 directa via Spider ===' AS referencia;
+SELECT c.region,
+COUNT(DISTINCT c.id) AS
+clientes_activos,
+COUNT(DISTINCT p.id) AS
+pedidos,
+GROUP_CONCAT(DISTINCT vb.categoria ORDER BY vb.categoria)
+AS categorias,
+ROUND(SUM(dp.subtotal), 2) AS
+facturacion_total
+FROM clientes c
+JOIN pedidos p ON p.cliente_id = c.id
+JOIN detalle_pedidos dp ON dp.pedido_id = p.id
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+GROUP BY c.region
+ORDER BY facturacion_total DESC;
+EOF
+25
+
+E.5 Implementación manual de semijoin distribuida (VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- ==============================================================
+-- ESCENARIO: JOIN detalle_pedidos ⋈ v_productos_basico
+-- ==============================================================
+-- ─────────────────────────────────────────────────────────────
+-- ESTRATEGIA A: JOIN NAIVE (sin reducción semijoin)
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== Estrategia A: JOIN naive (sin semijoin) ===' AS estrategia;
+FLUSH STATUS;
+SELECT dp.pedido_id,
+vb.nombre AS producto,
+vb.categoria,
+dp.cantidad,
+dp.subtotal
+FROM detalle_pedidos dp
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+ORDER BY dp.pedido_id
+LIMIT 10;
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next',
+'Handler_read_key',
+'Handler_read_next',
+'Bytes_sent'
+);
+-- ─────────────────────────────────────────────────────────────
+-- ESTRATEGIA B: SEMIJOIN MANUAL (algoritmo Bernstein-Chiu)
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== Estrategia B: Semijoin manual (Bernstein-Chiu) ==='
+AS estrategia;
+-- Paso B.1: Proyectar los IDs de join desde detalle_pedidos
+SELECT '--- Paso B.1: IDs únicos de join en detalle_pedidos ---' AS paso;
+SELECT DISTINCT producto_id AS id_join
+FROM detalle_pedidos
+ORDER BY producto_id;
+-- Paso B.2: Filtrar v_productos_basico (semijoin aplicado en nodo04)
+SELECT '--- Paso B.2: v_productos_basico reducido por semijoin ---' AS paso;
+SELECT id, nombre, categoria, precio
+FROM v_productos_basico
+WHERE id IN (
+26
+
+SELECT DISTINCT producto_id FROM detalle_pedidos
+);
+-- Paso B.3: JOIN completo usando el resultado del semijoin
+SELECT '--- Paso B.3: JOIN final con v_productos_basico filtrado ---'
+AS paso;
+FLUSH STATUS;
+SELECT dp.pedido_id,
+vb.nombre AS producto,
+vb.categoria,
+dp.cantidad,
+dp.subtotal
+FROM detalle_pedidos dp
+JOIN v_productos_basico vb ON vb.id = dp.producto_id
+AND vb.id IN (
+SELECT DISTINCT producto_id
+FROM detalle_pedidos
+)
+ORDER BY dp.pedido_id
+LIMIT 10;
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next',
+'Handler_read_key',
+'Handler_read_next',
+'Bytes_sent'
+);
+-- ─────────────────────────────────────────────────────────────
+-- ANÁLISIS DEL BENEFICIO DEL SEMIJOIN
+-- ─────────────────────────────────────────────────────────────
+SELECT '=== Análisis del beneficio teórico ===' AS analisis;
+SELECT
+'Paso B.1: transferir solo IDs de join' AS etapa,
+COUNT(DISTINCT producto_id) AS filas_transferidas,
+COUNT(DISTINCT producto_id) * 4 AS bytes_aprox,
+'IDs (4 bytes cada uno)' AS que_se_transfiere
+FROM detalle_pedidos
+UNION ALL
+SELECT
+'Estrategia A: v_productos_basico completo',
+COUNT(*),
+COUNT(*) * 100,
+'Filas completas de v_productos_basico'
+FROM v_productos_basico
+UNION ALL
+SELECT
+27
+
+'Paso B.2: v_productos_basico reducido (semijoin)',
+COUNT(*),
+COUNT(*) * 100,
+'Solo filas con producto_id en detalle_pedidos'
+FROM v_productos_basico
+WHERE id IN (SELECT DISTINCT producto_id FROM detalle_pedidos);
+-- Fórmula general del beneficio del semijoin:
+SELECT 'Condición de rentabilidad del semijoin:' AS formula,
+'size(S) > size(π_a(S)) + size(R ⋉ S)' AS condicion,
+'Con nuestros datos: 1 KB > 0.04 KB + 1 KB → NO es rentable (caso
+límite)' AS evaluacion;
+EOF
+28
+
+E.6 Comparación: proyección temprana vs. SELECT * (VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+-- Versión 1: SELECT * (todas las columnas de clientes)
+SELECT '=== Versión 1: SELECT * FROM clientes (todas las columnas) ==='
+AS experimento;
+FLUSH STATUS;
+SELECT * FROM clientes WHERE region = 'norte';
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next', 'Handler_read_key',
+'Handler_read_next', 'Bytes_sent'
+);
+-- Versión 2: Proyección explícita (solo 4 columnas)
+SELECT '=== Versión 2: Proyección explícita (id, nombre, apellido, region)
+===' AS experimento;
+FLUSH STATUS;
+SELECT id, nombre, apellido, region
+FROM clientes
+WHERE region = 'norte';
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next', 'Handler_read_key',
+'Handler_read_next', 'Bytes_sent'
+);
+-- Resumen: columnas de clientes y su ancho estimado
+SELECT COLUMN_NAME,
+DATA_TYPE,
+COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, 8)
+AS ancho_max_bytes,
+CASE
+WHEN COLUMN_NAME IN ('id','nombre','apellido','region')
+THEN 'PROYECTADA'
+ELSE 'omitida con proyección'
+END AS en_version2
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'lab_bdd'
+AND TABLE_NAME = 'clientes'
+ORDER BY ORDINAL_POSITION;
+EOF
+29
+
+E.7 Verificación de poda por índice en subconsultas remotas (VM —
+nodo06 y nodo04)
+Bash
+# En nodo06: plan de ejecución del coordinador
+sudo mariadb lab_bdd << 'EOF'
+SELECT '=== A1: clientes SIN filtro (ambas particiones) ===' AS variante;
+EXPLAIN SELECT id, nombre, region FROM clientes;
+SELECT '=== A2: clientes CON region=norte (solo frag_A) ===' AS variante;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region = 'norte';
+SELECT '=== A3: clientes CON region IN (norte,este) (solo frag_A) ==='
+AS variante;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region IN
+('norte', 'este');
+SELECT '=== A4: clientes CON region IN (norte,sur) (frag_A + frag_B) ==='
+AS variante;
+EXPLAIN SELECT id, nombre, region FROM clientes WHERE region IN
+('norte', 'sur');
+SELECT '=== B1: pedidos CON region=sur+oeste (solo frag_B) ===' AS variante;
+EXPLAIN SELECT id, total FROM pedidos WHERE region IN ('sur', 'oeste');
+SELECT '=== C1: detalle_pedidos VIEW (siempre accede a ambas tablas Spider)
+===' AS variante;
+EXPLAIN SELECT COUNT(*) FROM detalle_pedidos;
+SELECT '=== C2: spider_detalle_nodo04 directa (solo nodo04) ===' AS variante;
+EXPLAIN SELECT COUNT(*) FROM spider_detalle_nodo04;
+SELECT '=== D1: SELECT id FROM v_productos_basico (solo nodo04) ==='
+AS variante;
+EXPLAIN SELECT id, nombre FROM v_productos_basico WHERE id = 1;
+SELECT '=== D2: SELECT * FROM productos VIEW (JOIN nodo04+nodo05) ==='
+AS variante;
+EXPLAIN SELECT id, nombre, descripcion FROM productos WHERE id = 1;
+EOF
+30
+
+Bash
+# En nodo04: subconsultas remotas simuladas y verificación de planes locales
+sudo mariadb lab_bdd << 'EOF'
+SELECT '=== Subconsulta local: clientes WHERE region=norte ==='
+AS subconsulta;
+EXPLAIN
+SELECT id, nombre, apellido, region, ciudad
+FROM clientes
+WHERE region = 'norte';
+SELECT '=== Subconsulta local: pedidos WHERE region=norte ==='
+AS subconsulta;
+EXPLAIN
+SELECT id, cliente_id, total, estado
+FROM pedidos
+WHERE region = 'norte';
+SELECT '=== Subconsulta local: detalle_pedidos con IN (IDs de pedidos) ==='
+AS subconsulta;
+EXPLAIN
+SELECT id, pedido_id, producto_id, cantidad, subtotal
+FROM detalle_pedidos
+WHERE pedido_id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+-- Medir el I/O real con predicado de región (usa índice) vs. sin él
+SELECT '=== I/O real: pedidos WHERE region=norte ===' AS medicion;
+FLUSH STATUS;
+SELECT id, cliente_id, total FROM pedidos WHERE region = 'norte';
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next', 'Handler_read_key', 'Handler_read_next'
+);
+SELECT '=== I/O real: pedidos SIN predicado (full fragment scan) ==='
+AS medicion;
+FLUSH STATUS;
+SELECT id, cliente_id, total FROM pedidos;
+SHOW STATUS WHERE Variable_name IN (
+'Handler_read_rnd_next', 'Handler_read_key', 'Handler_read_next'
+);
+EOF
+Observación pedagógica: con fragmentos de 10 filas, InnoDB puede preferir un full scan
+sobre el uso del índice porque el coste de acceso a la estructura del índice supera el de leer
+directamente las 10 filas del tablespace. Este comportamiento es correcto y esperado. Con
+fragmentos de 10 000 filas o más, el optimizador elegiría el índice y el beneficio sería
+proporcional a la selectividad del predicado.
+31
+
+32
+
+E.8 Crear el procedimiento analizar_consulta() (VM — nodo06)
+Bash
+sudo mariadb lab_bdd << 'EOF'
+DROP PROCEDURE IF EXISTS analizar_consulta;
+DELIMITER //
+CREATE PROCEDURE analizar_consulta(
+IN p_region ENUM('norte','sur','este','oeste'),
+IN p_incluir_vertical BOOLEAN
+)
+COMMENT 'Muestra el plan de descomposición estimado y el grado de localidad'
+BEGIN
+DECLARE v_nodo_h VARCHAR(30) DEFAULT 'nodo04+nodo05 (ambos)';
+DECLARE v_filas_h INT DEFAULT 20;
+DECLARE v_filas_dp INT DEFAULT 36;
+DECLARE v_grado TINYINT DEFAULT 1;
+DECLARE v_grado_txt VARCHAR(80) DEFAULT 'Horizontal puro —
+ambos shards';
+IF p_region IN ('norte', 'este') THEN
+SET v_nodo_h = 'bdd-nodo04 (frag_A)';
+SET v_filas_h = 10;
+SET v_filas_dp = 18;
+SET v_grado = IF(p_incluir_vertical, 1, 0);
+ELSEIF p_region IN ('sur', 'oeste') THEN
+SET v_nodo_h = 'bdd-nodo05 (frag_B)';
+SET v_filas_h = 10;
+SET v_filas_dp = 18;
+SET v_grado = IF(p_incluir_vertical, 1, 0);
+ELSE
+SET v_grado = IF(p_incluir_vertical, 2, 1);
+END IF;
+SET v_grado_txt = CASE v_grado
+WHEN 0 THEN 'Máxima localidad — acceso a un solo nodo físico'
+WHEN 1 THEN CONCAT(IF(p_region IS NULL,
+'H-puro: ambos shards horizontales',
+'H+V-parcial: shard horizontal único + nodo05
+para detalle'))
+WHEN 2 THEN 'Distribución total — H (nodo04+nodo05) y
+V (nodo04+nodo05)'
+ELSE '?'
+END;
+SELECT CONCAT(
+'PLAN DE DESCOMPOSICIÓN ESTIMADO',
+' | Región: ', COALESCE(p_region, 'TODAS'),
+33
+
+' | Vertical: ', IF(p_incluir_vertical, 'SÍ
+(v_productos_detalle)', 'NO'),
+' | Grado de localidad: ', v_grado, ' — ', v_grado_txt
+) AS descripcion_plan;
+SELECT fragmento,
+nodo_fisico,
+filas_est,
+bytes_por_fila,
+filas_est * bytes_por_fila AS
+bytes_transfer_est,
+ROUND(filas_est * bytes_por_fila / 1024.0, 2) AS KB_est
+FROM (
+SELECT 'clientes' AS fragmento,
+v_nodo_h AS nodo_fisico,
+v_filas_h AS filas_est,
+120 AS bytes_por_fila, 1 AS ord
+UNION ALL
+SELECT 'pedidos', v_nodo_h, v_filas_h, 90, 2
+UNION ALL
+SELECT 'detalle_pedidos', v_nodo_h, v_filas_dp, 60, 3
+UNION ALL
+SELECT 'v_productos_basico', 'bdd-nodo04 (siempre)', 10, 100, 4
+UNION ALL
+SELECT 'v_productos_detalle', 'bdd-nodo05 (siempre)',
+IF(p_incluir_vertical, 10, 0),
+IF(p_incluir_vertical, 150, 0), 5
+) AS plan
+WHERE filas_est > 0
+ORDER BY ord;
+SELECT ROUND(
+(v_filas_h * 120 +
+v_filas_h * 90 +
+v_filas_dp * 60 +
+10 * 100 +
+IF(p_incluir_vertical, 10 * 150, 0)) / 1024.0, 1
+) AS total_KB_estimado,
+v_grado AS grado_de_localidad,
+v_grado_txt AS descripcion;
+END //
+DELIMITER ;
+-- Pruebas del procedimiento
+SELECT '--- analizar_consulta(norte, FALSE) → grado 0, solo nodo04 ---'
+AS demo;
+CALL analizar_consulta('norte', FALSE);
+SELECT '--- analizar_consulta(norte, TRUE) → grado 1, nodo04+nodo05
+34
+
+(vertical) ---' AS demo;
+CALL analizar_consulta('norte', TRUE);
+SELECT '--- analizar_consulta(NULL, FALSE) → grado 1, ambos shards
+horizontales ---' AS demo;
+CALL analizar_consulta(NULL, FALSE);
+SELECT '--- analizar_consulta(NULL, TRUE) → grado 2, distribución total ---'
+AS demo;
+CALL analizar_consulta(NULL, TRUE);
+SELECT '--- analizar_consulta(sur, FALSE) → grado 0, solo nodo05 ---'
+AS demo;
+CALL analizar_consulta('sur', FALSE);
+EOF
+E.9 Crear bdd-nodo07 ( bdd-cliente ) como clon enlazado (host)
+PowerShell
+# Verificar que todos los nodos están apagados antes de clonar
+VBoxManage list runningvms
+# La salida debe estar vacía
+# Crear bdd-nodo07 como clon enlazado desde fase06-completa de nodo01
+# fase06-completa = Ubuntu Server + SSH + IP configurada + SIN MariaDB Server
+VBoxManage clonevm "bdd-nodo01" `
+--snapshot "fase06-completa" `
+--options linked `
+--name "bdd-nodo07" `
+--basefolder "C:\LabBDD\VMs" `
+--register
+VBoxManage modifyvm "bdd-nodo07" `
+--memory 1024 `
+--description "CLIENTE EXTERNO (bdd-cliente). Solo mariadb-client. IP
+192.168.56.107. Conecta exclusivamente a nodo06. Fase 16."
+# Verificar el registro
+VBoxManage showvminfo "bdd-nodo07" | findstr /I "Name State Memory Description"
+35
+
+E.10 Configurar bdd-nodo07 (hostname, IP y cliente MariaDB) (host + VM)
+PowerShell
+# Arrancar solo nodo07 (nodo01 apagado → sin conflicto de IP)
+VBoxManage startvm "bdd-nodo07" --type headless
+Start-Sleep -Seconds 35
+# El clon hereda temporalmente la IP de nodo01 (192.168.56.101)
+ssh bddadmin@192.168.56.101
+(VM — nodo07):
+Bash
+# ── 1. Cambiar el hostname ────────────────────────────────────
+sudo hostnamectl set-hostname bdd-cliente
+sudo sed -i 's/bdd-nodo01/bdd-cliente/g' /etc/hosts
+hostname
+# Esperado: bdd-cliente
+Bash
+# ── 2. Cambiar la IP estática de .101 a .107 ─────────────────
+NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -1)
+echo "Archivo Netplan: $NETPLAN_FILE"
+sudo sed -i 's/192\.168\.56\.101/192.168.56.107/g' "$NETPLAN_FILE"
+grep "192.168" "$NETPLAN_FILE"
+# Aplicar — la sesión SSH se interrumpe aquí
+sudo netplan apply
+Reconectar a la nueva IP:
+PowerShell
+Start-Sleep -Seconds 8
+ssh bddadmin@192.168.56.107
+(VM — nodo07) — continuar:
+36
+
+Bash
+# ── 3. Verificar la nueva IP ──────────────────────────────────
+ip addr show | grep "192.168.56"
+# Esperado: inet 192.168.56.107/24
+ping -c 2 192.168.56.1
+Bash
+# ── 4. Regenerar las claves SSH ───────────────────────────────
+sudo rm -f /etc/ssh/ssh_host_*
+sudo ssh-keygen -A
+sudo systemctl restart ssh
+echo "Claves SSH regeneradas:"
+ls /etc/ssh/ssh_host_*.pub
+Bash
+# ── 5. Instalar mariadb-client (SIN el servidor) ─────────────
+sudo apt-get update
+sudo apt-get install -y mariadb-client
+# Verificar que el cliente existe pero el servidor NO
+which mariadb
+# Esperado: /usr/bin/mariadb
+systemctl status mariadb 2>&1 | head -5
+# Esperado: Unit mariadb.service could not be found
+37
+
+Bash
+# ── 6. Registrar todos los nodos en /etc/hosts ────────────────
+sudo tee -a /etc/hosts > /dev/null << 'EOF'
+# Laboratorio BDD — todos los nodos
+192.168.56.101 bdd-nodo01
+192.168.56.102 bdd-nodo02
+192.168.56.103 bdd-nodo03
+192.168.56.104 bdd-nodo04
+192.168.56.105 bdd-nodo05
+192.168.56.106 bdd-nodo06
+192.168.56.107 bdd-cliente
+EOF
+cat /etc/hosts
+Bash
+# ── 7. Verificar conectividad hacia el coordinador ────────────
+ping -c 3 192.168.56.106
+nc -zv 192.168.56.106 3306
+# Esperado: Connection to 192.168.56.106 3306 port [tcp/mysql] succeeded!
+E.11 Reiniciar nodo04, nodo05 y nodo06 con nodo07 ya activo (host)
+PowerShell
+VBoxManage startvm "bdd-nodo04" --type headless
+VBoxManage startvm "bdd-nodo05" --type headless
+VBoxManage startvm "bdd-nodo06" --type headless
+Start-Sleep -Seconds 40
+VBoxManage list runningvms
+# Deben aparecer: bdd-nodo04, bdd-nodo05, bdd-nodo06, bdd-nodo07
+Verificar la conectividad de red completa desde bdd-cliente :
+38
+
+Bash
+# En bdd-nodo07 — verificar toda la red del laboratorio
+for ip in 104 105 106; do
+echo -n "Conectividad a 192.168.56.$ip: "
+ping -c 1 -W 2 192.168.56.$ip > /dev/null 2>&1 && echo "OK" ||
+echo "FALLA"
+done
+# Verificar acceso al puerto 3306 del coordinador
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT 'Conexion exitosa a nodo06' AS estado, @@hostname AS
+coordinador;" \
+2>/dev/null
+Verificar que bdd-cliente NO puede conectarse directamente a los shards:
+Bash
+# Intento de acceso directo a nodo04 (debe fallar)
+mariadb -h 192.168.56.104 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT 1;" \
+2>&1 | head -3
+# Esperado: ERROR 1045 (28000): Access denied
+# Intento de acceso directo a nodo05 (debe fallar)
+mariadb -h 192.168.56.105 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT 1;" \
+2>&1 | head -3
+# Esperado: ERROR 1045 (28000): Access denied
+39
+
+E.12 Crear el usuario app_final para bdd-cliente en nodo06 (VM —
+nodo06)
+Bash
+sudo mariadb << 'EOF'
+-- Verificar entradas actuales de app_final
+SELECT User, Host FROM mysql.user WHERE User = 'app_final';
+-- Crear entrada específica para bdd-cliente (192.168.56.107)
+CREATE USER IF NOT EXISTS 'app_final'@'192.168.56.107'
+IDENTIFIED BY 'AppFinal_2025!';
+GRANT SELECT, INSERT, UPDATE, DELETE ON lab_bdd.*
+TO 'app_final'@'192.168.56.107';
+GRANT EXECUTE ON lab_bdd.*
+TO 'app_final'@'192.168.56.107';
+FLUSH PRIVILEGES;
+-- Verificar todos los hosts de app_final
+SELECT User, Host FROM mysql.user WHERE User = 'app_final' ORDER BY Host;
+SHOW GRANTS FOR 'app_final'@'192.168.56.107';
+EOF
+E.13 Pruebas de transparencia desde bdd-cliente (VM — nodo07)
+Bash
+echo "========================================"
+echo "PRUEBA 1: Conexión al sistema distribuido"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT @@hostname AS servidor_conectado,
+@@server_id AS server_id,
+DATABASE() AS base_de_datos;" \
+2>/dev/null
+# Esperado: bdd-nodo06, 6, lab_bdd
+40
+
+Bash
+echo "========================================"
+echo "PRUEBA 2: Ver objetos del esquema"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SHOW TABLES;" \
+2>/dev/null
+Bash
+echo "========================================"
+echo "PRUEBA 3: Lectura global (accede a 2 shards invisiblemente)"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT region,
+COUNT(*) AS total_clientes
+FROM clientes
+GROUP BY region
+ORDER BY region;" \
+2>/dev/null
+# Esperado: este=5, norte=5, oeste=5, sur=5
+41
+
+Bash
+echo "========================================"
+echo "PRUEBA 4: Poda automática (accede a solo un shard)"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT id, nombre, apellido, ciudad
+FROM clientes
+WHERE region = 'norte'
+ORDER BY id;" \
+2>/dev/null
+# Esperado: 5 clientes de la región norte
+Bash
+echo "========================================"
+echo "PRUEBA 5: Catálogo de productos (JOIN distribuido vertical)"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT id, sku, nombre, categoria, precio, stock,
+LEFT(descripcion, 60) AS descripcion_preview,
+peso_kg
+FROM productos
+ORDER BY categoria, precio;" \
+2>/dev/null
+# Esperado: 10 productos con columnas de ambos fragmentos verticales
+42
+
+Bash
+echo "========================================"
+echo "PRUEBA 6: Reporte de negocio vía vista encapsulada"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT region,
+COUNT(*) AS lineas_facturadas,
+ROUND(SUM(subtotal), 2) AS total_region
+FROM reporte_pedidos_detallado
+GROUP BY region
+ORDER BY total_region DESC;" \
+2>/dev/null
+# Esperado: 4 filas con datos de facturación de todas las regiones
+Bash
+echo "========================================"
+echo "PRUEBA 7: Llamada al procedimiento almacenado"
+echo "========================================"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "CALL consulta_regional(NULL);" \
+2>/dev/null
+# Esperado: 4 filas con resumen de todas las regiones
+echo "--- Procedimiento filtrado por región ---"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "CALL consulta_regional('este');" \
+2>/dev/null
+# Esperado: 1 fila con datos de la región este
+43
+
+Bash
+echo "========================================"
+echo "PRUEBA 8: Verificación de transparencia"
+echo "El cliente NO puede ver la infraestructura interna"
+echo "========================================"
+echo "--- 8a: Intentar SELECT en mysql.servers (debe fallar) ---"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT * FROM mysql.servers;" \
+2>&1 | head -3
+# Esperado: ERROR 1142 (42000): SELECT command denied
+echo "--- 8b: Intentar conexión directa a nodo04 (debe fallar) ---"
+mariadb -h 192.168.56.104 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT 1;" \
+2>&1 | head -3
+# Esperado: ERROR 1045 (28000): Access denied
+echo "--- 8c: Intentar conexión directa a nodo05 (debe fallar) ---"
+mariadb -h 192.168.56.105 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT 1;" \
+2>&1 | head -3
+# Esperado: ERROR 1045 (28000): Access denied
+echo "--- 8d: Intentar ver usuarios del sistema en nodo06 (debe fallar) ---"
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+-e "SELECT User, Host FROM mysql.user;" \
+2>&1 | head -3
+# Esperado: ERROR 1142 (42000): SELECT command denied
+echo ""
+echo "=========================================="
+echo "RESUMEN: conteos globales desde bdd-cliente"
+echo "=========================================="
+mariadb -h 192.168.56.106 \
+-u app_final \
+-p'AppFinal_2025!' \
+lab_bdd \
+-e "SELECT 'clientes' AS tabla, COUNT(*) AS filas
+FROM clientes
+UNION ALL
+44
+
+SELECT 'pedidos', COUNT(*) FROM pedidos
+UNION ALL
+SELECT 'detalle_pedidos', COUNT(*) FROM detalle_pedidos
+UNION ALL
+SELECT 'productos (VIEW)', COUNT(*) FROM productos;" \
+2>/dev/null
+# Esperado: 20 / 20 / ~36 / 10
+E.14 Apagar los nodos y tomar los snapshots fase16-completa (host)
+Bash
+# En la sesión SSH de bdd-nodo07 (bdd-cliente)
+sudo poweroff
+# En la sesión SSH de bdd-nodo06
+sudo poweroff
+# En la sesión SSH de bdd-nodo04
+sudo poweroff
+# En la sesión SSH de bdd-nodo05
+sudo poweroff
+PowerShell
+Start-Sleep -Seconds 35
+VBoxManage list runningvms
+# La salida debe estar vacía
+45
+
+PowerShell
+VBoxManage snapshot "bdd-nodo01" take "fase16-completa" `
+--description "Sin cambios en Fase 16. Miembro Galera. Snapshot de hito
+de fase."
+VBoxManage snapshot "bdd-nodo02" take "fase16-completa" `
+--description "Sin cambios en Fase 16. Miembro Galera. Snapshot de hito
+de fase."
+VBoxManage snapshot "bdd-nodo03" take "fase16-completa" `
+--description "Sin cambios en Fase 16. Miembro Galera. Snapshot de hito
+de fase."
+VBoxManage snapshot "bdd-nodo04" take "fase16-completa" `
+--description "SHARD-A: tabla productos original eliminada.
+v_productos_basico(10 filas) es el fragmento vertical definitivo. Analisis de
+costes ejecutado. Poda por indice verificada con EXPLAIN."
+VBoxManage snapshot "bdd-nodo05" take "fase16-completa" `
+--description "SHARD-B: tabla productos original eliminada.
+v_productos_detalle(10 filas) es el fragmento vertical definitivo. Analisis de
+costes ejecutado."
+VBoxManage snapshot "bdd-nodo06" take "fase16-completa" `
+--description "COORDINADOR: PROCEDURE analizar_consulta() creado.
+app_final@192.168.56.107 habilitado. 4 fases de descomposicion simuladas.
+Semijoin manual verificado. Transparencia verificada desde bdd-cliente."
+VBoxManage snapshot "bdd-nodo07" take "fase16-completa" `
+--description "CLIENTE EXTERNO (bdd-cliente): primer snapshot. Ubuntu Server +
+mariadb-client. IP 192.168.56.107. Conecta a nodo06 via app_final. 8 pruebas de
+transparencia superadas. Sin acceso a shards internos."
+PowerShell
+VBoxManage snapshot "bdd-nodo04" list
+VBoxManage snapshot "bdd-nodo05" list
+VBoxManage snapshot "bdd-nodo06" list
+VBoxManage snapshot "bdd-nodo07" list
+F. Verificación de funcionamiento
+Esta fase se considera completa cuando se cumplen todos los puntos siguientes:
+ SHOW TABLES IN lab_bdd en nodo no muestra la tabla productos (solo clientes 
+detalle_pedidos  pedidos  v_productos_basico )
+46
+
+ SHOW TABLES IN lab_bdd  en nodo no muestra la tabla  productos  (solo  clientes 
+| detalle_pedidos |     |   pedidos |   v_productos_detalle |     | )  |     |
+| --------------- | --- | ---------- | ---------------------- | --- | --- | --- |
+ Las VIEWs  v_productos_basico   v_productos_detalle  y  productos  en nodo
+devuelven  filas cada una tras eliminar la tabla   original de los shards
+productos
+  se ejecutó correctamente en las cuatro tablas de cada shard
+ANALYZE TABLE
+information_schema.TABLES  muestra  TABLE_ROWS > 0  y  AVG_ROW_LENGTH > 0  para
+todas ellas
+ La simulación de la Fase  (ejecución distribuida manual) del bloque E devuelve
+exactamente  filas con los mismos valores que la consulta H- directa vía Spider los
+resultados son idénticos en cada columna
+ La estrategia A (JOIN naive) y la estrategia B (semijoin manual) del bloque E devuelven
+el mismo resultado de negocio (mismas filas y mismos valores)
+ SHOW STATUS LIKE 'Handler_read_rnd_next'  devuelve valores >  tras ejecutar una
+consulta de conteo sin índice sobre una tabla de un shard (comportamiento esperado con
+fragmentos pequeños)
+ EXPLAIN SELECT id, nombre FROM clientes WHERE region = 'norte'  en nodo
+| muestra  |     |     |  únicamente |     |     |     |
+| -------- | --- | --- | ------------ | --- | --- | --- |
+partitions: frag_A
+|   |     |     |     |     |  sin filtro en nodo muestra ambas  |     |
+| --- | --- | --- | --- | --- | ------------------------------------ | --- |
+EXPLAIN SELECT id, nombre FROM clientes
+| particiones  | frag_A, frag_B |     |    |     |     |     |
+| ------------ | -------------- | --- | --- | --- | --- | --- |
+ EXPLAIN SELECT COUNT(*) FROM detalle_pedidos  en nodo no muestra poda de
+partición (VIEW UNION ALL accede a ambas tablas subyacentes)
+
+EXPLAIN SELECT id, pedido_id FROM detalle_pedidos WHERE pedido_id IN (1,2,3)
+ejecutado directamente en nodo muestra uso del índice  idx_pedido 
+ La comparación de  Bytes_sent  entre  SELECT *  y proyección explícita sobre  clientes
+|                       |     |  muestra un valor mayor para  |     |     |     |           |
+| --------------------- | --- | ----------------------------- | --- | --- | --- | ---------- |
+| WHERE region='norte'  |     |                               |     |     |     | SELECT *   |
+|  El procedimiento  |     |                               |     |     |     |  devuelve  |
+analizar_consulta('norte', FALSE) grado_de_localidad =
+0  y los fragmentos de nodo únicamente
+ El procedimiento  analizar_consulta(NULL, TRUE)  devuelve  grado_de_localidad = 2 
+ VBoxManage showvminfo "bdd-nodo07"  confirma la VM registrada con el nombre correcto
+|  hostname |  en nodo devuelve  |     | bdd-cliente |     |    |     |
+| ------------ | -------------------- | --- | ----------- | --- | --- | --- |
+ ip addr show | grep 192.168.56  en nodo muestra  192.168.56.107/24 
+ systemctl status mariadb  en nodo indica que el servicio no existe (cliente
+solamente)
+|  which mariadb |     |  en nodo devuelve  |     | /usr/bin/mariadb |     |    |
+| ----------------- | --- | -------------------- | --- | ---------------- | --- | --- |
+ La Prueba  desde bdd-cliente devuelve exactamente  filas con  clientes por región
+ La Prueba  desde bdd-cliente devuelve exactamente  clientes con  region = 'norte' 
+47
+
+ La Prueba  desde bdd-cliente devuelve exactamente  productos con columnas de
+ambos fragmentos verticales combinadas
+ La Prueba  desde bdd-cliente devuelve  filas con datos de facturación no nulos
+ CALL consulta_regional(NULL) desde bdd-cliente devuelve  filas
+ CALL consulta_regional('este') desde bdd-cliente devuelve  fila
+ La Prueba a produce ERROR 1142 (42000) o similar (acceso denegado a
+mysql.servers )
+ Las Pruebas b y c producen ERROR 1045 (28000) al intentar conectar a nodo y
+nodo
+ Los snapshots fase16-completa existen en los siete nodos del laboratorio
+ El estudiante puede enumerar de memoria las cuatro fases del procesamiento de
+consultas distribuidas
+ El estudiante puede definir el semijoin distribuido y la condición que lo hace rentable
+48
+
+G. Problemas comunes y soluciones
+| Problema       |      | Causa probable    |      | Solución           |          |
+| -------------- | ---- | ----------------- | ---- | ------------------ | -------- |
+| SELECT         |      | La tabla Spider   |      | Verificar en       |          |
+| COUNT(*) FROM  |      | v_productos_ba    |      | nodo:            | SHOW     |
+| productos      |  en  | sico              |  de  | TABLES LIKE        |          |
+| nodo falla   |      | nodo apunta     |      | 'v_productos%      |          |
+| después de     |      | a la tabla        |      | '                  |  — debe  |
+| DROP TABLE     |      | correcta pero la  |      | mostrar            |          |
+| productos      |  en  | VIEW              |      | v_productos_ba     |          |
+| los shards     |      | productos         |      |   sico             |  si no  |
+|                |      | hace JOIN de      |      | existe restaurar  |          |
+|                |      | v_productos_ba    |      | nodo desde       |          |
+|                |      | sico              |  y   | fase14-            |          |
+|                |      | v_productos_de    |      | completa           |          |
+talle  si
+alguna de éstas
+se eliminó
+Spider no
+encuentra la
+tabla remota
+| SHOW TABLES IN  |      | El                | DROP TABLE |   Ejecutar     | DROP  |
+| --------------- | ---- | ----------------- | ---------- | -------------- | ----- |
+| lab_bdd         |  en  | no se ejecutó o   |            | TABLE IF       |       |
+| nodo sigue    |      | se ejecutó en el  |            | EXISTS         |       |
+| mostrando       |      | nodo              |            | lab_bdd.produc |       |
+equivocado
+| productos      |  tras  |     |     | tos              |     |
+| -------------- | ------ | --- | --- | ---------------- | --- |
+| el  DROP TABLE |        |     |     | directamente en  |     |
+nodo
+verificar con
+SHOW TABLES
+| La Fase    |     | Las tablas       |     | Verificar con  |     |
+| ----------- | --- | ---------------- | --- | -------------- | --- |
+| (ejecución  |     | Spider directas  |     | SELECT         |     |
+| manual)     |     | spider_detalle   |     | COUNT(*) FROM  |     |
+| produce     |     | _nodo04          |  y  |                |     |
+spider_detalle
+| resultados  |     | spider_detalle |     |     |  y  |
+| ----------- | --- | -------------- | --- | --- | --- |
+_nodo04
+| distintos a H- |     | _nodo05 |  tienen  |     |     |
+| --------------- | --- | ------- | -------- | --- | --- |
+SELECT
+datos distintos a
+COUNT(*) FROM
+los que
+spider_detalle
+devuelve la
+|     |     |     |     | _nodo05 |  desde  |
+| --- | --- | --- | --- | ------- | ------- |
+VIEW
+nodo la suma
+detalle_pedido
+debe igualar
+s
+SELECT
+49
+
+COUNT(*) FROM
+detalle_pedido
+s
+| nc -zv          | MariaDB en      | En nodo:     |     |
+| --------------- | --------------- | -------------- | --- |
+| 192.168.56.106  | nodo tiene    | sudo mariadb - |     |
+| 3306  desde     | bind-address =  | e "SHOW        |     |
+ o no
+| bdd-cliente  | 127.0.0.1   | VARIABLES LIKE  |     |
+| ------------ | ----------- | --------------- | --- |
+| devuelve     | está activo | 'bind_address'  |     |
+Connection  ;"  — si
+refused devuelve
+127.0.0.1 
+aplicar el  sed
+de la Fase 
+verificar con
+sudo systemctl
+status
+mariadb
+nodo sigue  Apagar nodo
+ssh
+corriendo y  con  VBoxManage
+bddadmin@192.1
+  ambos tienen la  controlvm
+68.56.101
+| conecta al nodo  | IP  .101     |  al  "bdd-nodo01"  |     |
+| ---------------- | ------------ | ------------------ | --- |
+| equivocado al    | mismo tiempo |                    |     |
+acpipowerbutto
+configurar   antes de
+n
+nodo arrancar
+nodo esperar
+ segundos
+| VBoxManage  | El nombre del  | Ejecutar  |     |
+| ----------- | -------------- | --------- | --- |
+snapshot difiere
+| clonevm  falla  |     | VBoxManage  |     |
+| --------------- | --- | ----------- | --- |
+del esperado
+con  Could not  snapshot "bdd-
+| find a  |     | nodo01" list |     |
+| ------- | --- | ------------ | --- |
+snapshot named  y copiar el
+'fase06- nombre exacto
+ajustar el
+completa'
+comando
+clonevm
+| mariadb -h      | El usuario          | En nodo:               |     |
+| --------------- | ------------------- | ------------------------ | --- |
+| 192.168.56.106  | app_final           |  fue  ejecutar el        |     |
+| -u app_final    |   creado solo para  | bloque E              |     |
+| desde bdd-      | el host             | .1  pero  completo para  |     |
+crear
+| cliente produce  | no para  | .107 |     |
+| ---------------- | -------- | ---- | --- |
+ERROR 1045  app_final@'192
+(28000) .168.56.107'
+50
+
+| La Prueba b    | El puerto   | Verificar con  |     |
+| --------------- | --------------- | -------------- | --- |
+| muestra  ERROR  | de nodo está  | sudo ufw       |     |
+bloqueado por
+| 2003 (HY000):  |     | status |  en  |
+| -------------- | --- | ------ | ---- |
+firewall
+| Can't connect |     | nodo si está  |     |
+| ------------- | --- | ---------------- | --- |
+| en lugar de   |     | activo añadir   |     |
+| ERROR 1045    |     | sudo ufw allow   |     |
+from
+192.168.56.107
+to any port
+3306  el
+resultado
+esperado debe
+ser
+ERROR 1045
+| CALL           | El             | Ejecutar      | SHOW  |
+| -------------- | -------------- | ------------- | ----- |
+| analizar_consu | procedimiento  | PROCEDURE     |       |
+| lta('norte',   | no se creó     | STATUS WHERE  |       |
+| FALSE)  falla  | correctamente  | Db =          |       |
+| con            |                |               |  si  |
+| ERROR          |                | 'lab_bdd'     |       |
+no aparece
+1305:
+repetir el bloque
+PROCEDURE does
+E completo
+not exist
+incluyendo el
+DELIMITER //
+|     |   Problemas de  | Usar el  |     |
+| --- | --------------- | -------- | --- |
+netplan apply
+|             | indentación  | comando  |       |
+| ----------- | ------------ | -------- | ----- |
+| falla al    |              |          | sed - |
+| configurar  | YAML         |          |  sin  |
+i 's/...'
+| nodo |     | edición manual  |     |
+| ------ | --- | ---------------- | --- |
+validar con
+sudo netplan
+ antes de
+try
+aplicar
+| Las pruebas de  | Spider en      | Verificar con  |     |
+| --------------- | -------------- | -------------- | --- |
+| transparencia   | nodo no      | VBoxManage     |     |
+| – devuelven   | alcanza los    | list           |     |
+|  filas         | shards porque  |                |     |
+|                 |                | runningvms     |     |
+nodo/nodo
+que nodo
+no están
+nodo y
+encendidos
+nodo estén
+activos
+| El snapshot de  | La VM está en  | Apagar nodo  |     |
+| --------------- | -------------- | -------------- | --- |
+| nodo falla    | ejecución al   | con  sudo      |     |
+| con             | momento de     | poweroff       |    |
+esperar que el
+51
+
+| VBOX_E_INVALID |     | tomar el  |     | estado cambie a  |     |     |     |     |
+| -------------- | --- | --------- | --- | ---------------- | --- | --- | --- | --- |
+| _VM_STATE      |     | snapshot  |     | powered off      |     |  y  |     |     |
+reintentar
+H. Checklist de validación
+|                        |                    |     |  en nodo04 no incluye  |         |                       |           | ; muestra exactamente  |     |
+| ---------------------- | ------------------ | --- | ---------------------- | ------- | --------------------- | --------- | ---------------------- | --- |
+| SHOW TABLES IN lab_bdd |                    |     |                        |         |                       | productos |                        |     |
+| clientes               | ,  detalle_pedidos |     | ,                      | pedidos | ,  v_productos_basico |           | .                      |     |
+SHOW TABLES IN lab_bdd  en nodo05 no incluye  productos ; muestra exactamente
+|          | ,               |     | ,   |         | ,                   |     | .   |     |
+| -------- | --------------- | --- | --- | ------- | ------------------- | --- | --- | --- |
+| clientes | detalle_pedidos |     |     | pedidos | v_productos_detalle |     |     |     |
+SELECT COUNT(*) FROM v_productos_basico  en nodo06 devuelve 10.
+SELECT COUNT(*) FROM v_productos_detalle  en nodo06 devuelve 10.
+SELECT COUNT(*) FROM productos  (VIEW) en nodo06 devuelve 10 tras el DROP en los
+shards.
+ANALYZE TABLE  se ejecutó en todas las tablas de nodo04 y nodo05 sin errores.
+La tabla de costes generada en E.3 muestra valores de  bytes_totales_est > 0  para
+cada fragmento.
+La simulación de la Fase 4 (E.4) devuelve 4 filas idénticas a las de la consulta H-6 directa.
+Las estrategias A y B de semijoin (E.5) devuelven el mismo resultado de negocio.
+ en nodo06 muestra solo
+EXPLAIN SELECT * FROM clientes WHERE region='norte'
+| frag_A | .   |     |     |     |     |     |     |     |
+| ------ | --- | --- | --- | --- | --- | --- | --- | --- |
+EXPLAIN SELECT * FROM clientes  sin filtro en nodo06 muestra frag_A y frag_B.
+EXPLAIN SELECT COUNT(*) FROM detalle_pedidos  en nodo06 no muestra poda de
+partición.
+ en nodo04
+EXPLAIN SELECT id FROM detalle_pedidos WHERE pedido_id IN (1,2,3)
+| (directo) muestra uso del índice  |     |     |     | idx_pedido |     | .   |     |     |
+| --------------------------------- | --- | --- | --- | ---------- | --- | --- | --- | --- |
+La versión  SELECT *  produce un  Bytes_sent  mayor que la versión con proyección
+explícita.
+| El procedimiento           |     |                   |     |  existe en  |     |                             |     |  con  |
+| -------------------------- | --- | ----------------- | --- | ----------- | --- | --------------------------- | --- | ----- |
+|                            |     | analizar_consulta |     |             |     | information_schema.ROUTINES |     |       |
+| ROUTINE_SCHEMA = 'lab_bdd' |     |                   | .   |             |     |                             |     |       |
+CALL analizar_consulta('norte', FALSE)  devuelve  grado_de_localidad = 0 .
+CALL analizar_consulta(NULL, TRUE)  devuelve  grado_de_localidad = 2 .
+CALL analizar_consulta('sur', TRUE)  devuelve  grado_de_localidad = 1 .
+VBoxManage showvminfo "bdd-nodo07"  confirma la VM registrada como clon enlazado.
+| hostname |  en nodo07 devuelve  |     |     | bdd-cliente |     | .   |     |     |
+| -------- | -------------------- | --- | --- | ----------- | --- | --- | --- | --- |
+52
+
+ip addr show | grep 192.168.56 en nodo07 muestra 192.168.56.107/24 .
+systemctl status mariadb en nodo07 indica que el servicio no existe (cliente
+solamente).
+which mariadb en nodo07 devuelve /usr/bin/mariadb .
+La Prueba 2 desde bdd-cliente lista las tablas y VIEWs del esquema lab_bdd .
+La Prueba 3 desde bdd-cliente devuelve 4 filas con 5 clientes cada una.
+La Prueba 4 desde bdd-cliente devuelve 5 clientes con region = 'norte' .
+La Prueba 5 desde bdd-cliente devuelve 10 productos con columnas de basico y
+detalle combinadas.
+La Prueba 6 desde bdd-cliente devuelve 4 filas con facturación por región.
+CALL consulta_regional(NULL) desde bdd-cliente devuelve 4 filas.
+CALL consulta_regional('este') desde bdd-cliente devuelve 1 fila.
+La Prueba 8a produce error de acceso denegado a mysql.servers .
+Las Pruebas 8b y 8c producen error de acceso denegado al intentar conectar a nodo04
+y nodo05.
+Los snapshots fase16-completa existen en los siete nodos del laboratorio.
+Puedo enumerar de memoria las cuatro fases del procesamiento de consultas distribuidas.
+Puedo definir el semijoin distribuido y la condición que lo hace rentable ( size(S) >
+size(π_a(S)) + size(R ⋉ S) ).
+Puedo explicar por qué la VIEW detalle_pedidos (UNION ALL) no se beneficia del
+predicate pushdown automático de Spider.
+Preguntas teóricas para estudiantes
+ En la Fase  (optimización global) del bloque E se eligió la estrategia de sub-agregación
+por shard cada shard devuelve solo cuatro filas (una por región de su fragmento) en lugar
+de todas las filas brutas de clientes  pedidos y detalle_pedidos  Analiza cuándo esta
+estrategia es beneficial y cuándo no ¿qué ocurre si la consulta no tiene un GROUP BY ?
+¿qué ocurre si el GROUP BY es sobre una columna que no es el atributo de fragmentación
+(por ejemplo GROUP BY pedidos.estado en lugar de GROUP BY clientes.region )?
+¿puede el coordinador Spider aplicar esta sub-agregación automáticamente o siempre
+tiene que implementarla el desarrollador de forma manual?
+ El algoritmo de semijoin de Bernstein-Chiu resultó no ser rentable para el esquema actual
+del laboratorio porque todos los productos están referenciados en detalle_pedidos 
+Describe un escenario de negocio realista —utilizando exactamente el esquema lab_bdd
+53
+
+con algunas modificaciones de datos— en el que el semijoin sería altamente rentable
+¿cuántos productos habría que agregar al catálogo? ¿cuántos de ellos tendrían pedidos
+activos? ¿cuántas líneas de detalle_pedidos habría? y ¿cuál sería el porcentaje exacto
+de reducción de datos transferidos entre el coordinador y nodo?
+ La poda por índice en nodo (E) mostró que con fragmentos de  filas el optimizador
+InnoDB puede preferir un full scan sobre el uso del índice compuesto Explica el modelo de
+coste interno que usa InnoDB para tomar esa decisión ¿qué variable de configuración
+controla el umbral entre el acceso por índice y el full scan? ¿en qué unidad se mide el
+coste (filas bloques de disco tiempo)? ¿a partir de qué tamaño de fragmento esperaría
+que InnoDB eligiera el índice idx_region_cliente (region, cliente_id) de forma
+consistente? Apoya la respuesta con la salida de EXPLAIN que obtuviste en el laboratorio
+ La transparencia de distribución verificada en las Pruebas – cubre tres de los cuatro
+tipos definidos en la Fase  (fragmentación ubicación y replicación) El cuarto tipo —
+transparencia de concurrencia— no fue verificado en esta fase Diseña un escenario
+concreto de prueba de transparencia de concurrencia que podría ejecutarse desde bdd-
+cliente : ¿qué dos operaciones simultáneas demostrarían que el sistema gestiona la
+concurrencia de forma transparente para el cliente? ¿qué tablas y qué tipo de operaciones
+estarían involucradas? ¿en qué fase del laboratorio se realizará esta prueba y por qué se
+dejó para ese momento?
+ El procedimiento analizar_consulta() calcula el coste de transferencia usando la
+fórmula filas × bytes_por_fila  En un sistema de producción real el coste de
+comunicación en una red WAN incluye también la latencia de ida y vuelta (round-trip time
+RTT) Dado que la fórmula de coste total sería C = latencia × num_mensajes + filas ×
+bytes_por_fila / ancho_de_banda  analiza cómo cambia la estrategia óptima cuando la
+latencia domina sobre el volumen de datos ¿en qué situaciones el semijoin deja de ser
+beneficial aunque reduzca el volumen de datos? ¿por qué en la red Host-Only del
+laboratorio este factor no es observable? ¿qué parámetro podría configurarse en la red
+virtual de VirtualBox para simular latencia artificialmente?
+Ejercicios prácticos
+ Implementación completa del algoritmo de descomposición para una consulta nueva
+Seleccionar la consulta H- del catálogo de la Fase  (reporte analítico avanzado con
+peso y descripción de producto) y aplicar manualmente las cuatro fases de
+descomposición (a) escribir la expresión de álgebra relacional con proyecciones
+tempranas empujadas hacia las hojas (b) sustituir cada relación global por su expresión de
+fragmentos con los predicados simplificados © describir en texto el plan de optimización
+54
+
+global que minimiza el volumen de datos transferidos y (d) implementar la Fase 
+(ejecución distribuida manual) como consultas SQL en nodo usando las tablas Spider
+directas en lugar de las VIEWs verificando que el resultado sea idéntico a H- Documentar
+el coste estimado en KB para cada etapa
+ Benchmark de semijoin en un catálogo extendido Insertar  productos adicionales en
+v_productos_basico de nodo (con IDs del  al ) sin insertar líneas de detalle para
+ellos El catálogo pasa a tener  productos de los cuales solo  tienen pedidos activos
+Repetir el experimento de semijoin de E con el catálogo extendido (a) medir los
+Handler_read_rnd_next de la Estrategia A y la Estrategia B (b) calcular el porcentaje de
+reducción real de filas accedidas en v_productos_basico  © verificar que la condición de
+rentabilidad size(S) > size(π_a(S)) + size(R ⋉ S) ahora se cumple con los nuevos
+valores y (d) eliminar los  productos de prueba al finalizar Documentar todos los pasos
+con las salidas de SHOW STATUS 
+ Simulación de sesión completa de aplicación desde bdd-cliente  Escribir un script Bash
+en bdd-nodo07 ( /home/bddadmin/app_simulacion.sh ) que simule una sesión completa de
+la aplicación de negocio (a) conectar a nodo como app_final  (b) consultar el número
+de clientes por región © buscar pedidos entregados del mes más reciente (d) obtener la
+ficha completa de los tres productos más vendidos usando la VIEW productos  (e)
+calcular el ticket promedio por región vía CALL consulta_regional(NULL)  y (f) imprimir un
+reporte de resumen formateado en texto plano El script no debe incluir en ningún lugar las
+IPs de nodo ni nodo ni referencias a la fragmentación interna Ejecutarlo y
+documentar la salida completa
+Reto adicional para alumnos avanzados
+Implementar en bdd-nodo06 un motor de enrutamiento automático de semijoin mediante una
+tabla de metadatos y un procedimiento genérico:
+Crear la tabla lab_bdd.plan_semijoin con las columnas tabla_grande , tabla_pequeña ,
+atributo_join , selectividad_est (fracción de filas de tabla_grande que coinciden con
+tabla_pequeña ) y aplicar_semijoin (BOOLEAN calculado automáticamente cuando la
+condición de rentabilidad se cumple).
+Crear el procedimiento evaluar_semijoin(p_tabla_grande, p_tabla_pequeña, p_atributo)
+que: (1) consulta information_schema.TABLES para obtener TABLE_ROWS y AVG_ROW_LENGTH
+de ambas tablas, (2) estima size(π_a(S)) asumiendo 4 bytes por ID, (3) estima size(R ⋉
+S) usando la selectividad almacenada en plan_semijoin , (4) evalúa la condición de
+55
+
+rentabilidad size(S) > size(π_a(S)) + size(R ⋉ S) , y (5) actualiza
+plan_semijoin.aplicar_semijoin y devuelve un resultado con la recomendación y los
+valores intermedios.
+Poblar plan_semijoin con las cuatro combinaciones relevantes del esquema
+( detalle_pedidos ⋉ v_productos_basico , pedidos ⋉ clientes , etc.), ejecutar CALL
+evaluar_semijoin(...) para cada una y documentar cuáles resultan rentables con el dataset
+actual de 10–36 filas por fragmento y cuáles lo serían si los fragmentos tuvieran 10 000 filas
+con la misma selectividad.
+56
+
+Criterios de evaluación para el profesor
+| Criterio | Peso | Indicador de  |     |
+| -------- | ---- | ------------- | --- |
+logro
+| Eliminación de  | %  | La tabla     |     |
+| --------------- | --- | ------------ | --- |
+| redundancia     |     | productos    |     |
+| ( DROP TABLE    |     | original no  |     |
+| productos       | )   | existe en    |     |
+nodo ni
+nodo las
+VIEWs y tablas
+Spider del
+coordinador
+siguen
+funcionando sin
+interrupción tras
+el DROP
+| Análisis        | % | ANALYZE TABLE |     |
+| --------------- | --- | ------------- | --- |
+| estadístico de  |     | ejecutado en  |     |
+| costes          |     | todos los     |     |
+fragmentos el
+estudiante
+construye y
+puede
+interpretar la
+tabla de costes
+consolidada
+relacionando
+TABLE_ROWS ×
+AVG_ROW_LENGT
+ con el
+H
+volumen de
+transferencia de
+red
+| Simulación de     | % | Las cuatro fases  |     |
+| ----------------- | --- | ----------------- | --- |
+| las cuatro fases  |     | se ejecutan en    |     |
+| de                |     | SQL               |     |
+| descomposición    |     | correctamente    |     |
+el resultado de
+la Fase 
+manual es
+idéntico al de H-
+ directa el
+estudiante
+57
+
+puede explicar
+qué
+transformación
+algebraica
+ocurre en cada
+fase y cuál es el
+aporte de la
+sub-agregación
+por shard
+| Implementación  | % | Las Estrategias  |
+| --------------- | --- | ---------------- |
+| de semijoin     |     | A y B producen   |
+| distribuida     |     | el mismo         |
+resultado el
+estudiante mide
+y compara los
+Handler_read_
+*  puede
+evaluar la
+condición de
+rentabilidad del
+semijoin con los
+valores reales
+del dataset
+| Análisis     | % | Los EXPLAIN      |
+| ------------ | --- | ---------------- |
+| EXPLAIN y    |     | demuestran       |
+| métricas de  |     | poda en tablas   |
+| ejecución    |     | particionadas y  |
+ausencia de
+poda en la VIEW
+UNION ALL el
+estudiante
+compara
+Bytes_sent
+entre  SELECT *
+y proyección
+explícita
+| Procedimiento  | % | El             |
+| -------------- | --- | -------------- |
+| analizar_consu |     | procedimiento  |
+existe produce
+lta()
+resultados
+correctos para
+los cuatro casos
+de prueba
+58
+
+Provisionamient % nodo existe
+o y con IP .107 
+configuración hostname bdd-
+de bdd- cliente  sin
+cliente servidor
+MariaDB con
+mariadb-
+client
+instalado
+conecta
+correctamente a
+nodo
+Pruebas de % Las ocho
+transparencia pruebas
+desde bdd- producen los
+cliente resultados
+esperados las
+pruebas a-c
+confirman que el
+cliente no puede
+acceder a la
+infraestructura
+interna
+I. Preparación para la siguiente fase
+La Fase 17: Simulación de Fallos requerirá:
+• Los snapshots fase16-completa en los siete nodos del laboratorio (completados en esta
+fase)
+• bdd-nodo07 ( bdd-cliente ) operativo con mariadb-client instalado y conectividad
+verificada a nodo: será el punto de observación externo desde donde se verificará el
+comportamiento del sistema ante fallos
+• Comprensión del estado de replicación del clúster Galera (nodo–): es el mecanismo
+de alta disponibilidad que la Fase  pondrá a prueba deliberadamente Antes de iniciar la
+Fase  se deberá verificar que el clúster sigue en estado Primary con los tres nodos
+Synced 
+• La arquitectura de siete nodos completa documentada en esta fase es el escenario de
+referencia para los experimentos de fallos cada tipo de fallo (caída de shard caída del
+coordinador partición de red entre shards) produce un comportamiento distinto que la
+59
+
+Fase  analizará en términos del teorema CAP
+En la Fase 17 se simularán cuatro escenarios de fallo: (1) caída de un nodo del clúster Galera
+con verificación de quórum y recuperación automática, (2) caída de un shard (nodo04 o
+nodo05) y observación del comportamiento del coordinador Spider al intentar acceder al
+fragmento inaccesible, (3) caída del coordinador (nodo06) y recuperación con el estado de los
+shards intacto, y (4) desconexión de bdd-cliente durante una transacción en curso. Para
+cada escenario se documentará qué tipo de error recibe el cliente final, qué datos (si alguno)
+se pierden o quedan inaccesibles, y cuál es el procedimiento de recuperación.
+60
+
+---
+
 # Laboratorio-BDD-Completo
 
 Fase 0 — Planeación y Diseño del
