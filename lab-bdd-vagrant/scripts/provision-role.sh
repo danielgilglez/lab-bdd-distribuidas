@@ -102,18 +102,15 @@ CNF
     spider)
         echo "[$NODE_NAME] Instalando plugin MariaDB Spider..."
         DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-plugin-spider 2>/dev/null || true
-        cat > /etc/mysql/mariadb.conf.d/60-replication.cnf << CNF
+        cat > /etc/mysql/mariadb.conf.d/60-coordinador.cnf << CNF
 [mariadb]
 server_id = $NODE_ID
-log_bin = /var/log/mysql/mariadb-bin
-binlog_format = ROW
-expire_logs_days = 7
-max_binlog_size = 100M
-binlog_annotate_row_events = ON
-gtid_domain_id = 1
-log_slave_updates = ON
+# Coordinador Spider: no replica ni almacena datos de negocio
+log_bin = OFF
+skip_slave_start = ON
+read_only = OFF
+bind-address = 0.0.0.0
 skip_name_resolve = ON
-plugin_load_add = ha_spider
 CNF
         ;;
 esac
@@ -227,6 +224,18 @@ else
                     04-spider-setup.sql)
                         if [ "$ROLE" != "spider" ]; then
                             echo "     (saltado $BASENAME, solo spider)"
+                            SKIP=1
+                        fi
+                        ;;
+                    05-vertical-fragment-a.sql)
+                        if [ "$ROLE" != "shard" ] || [ "$NODE_NAME" != "bdd-nodo04" ]; then
+                            echo "     (saltado $BASENAME, solo shard A)"
+                            SKIP=1
+                        fi
+                        ;;
+                    05-vertical-fragment-b.sql)
+                        if [ "$ROLE" != "shard" ] || [ "$NODE_NAME" != "bdd-nodo05" ]; then
+                            echo "     (saltado $BASENAME, solo shard B)"
                             SKIP=1
                         fi
                         ;;

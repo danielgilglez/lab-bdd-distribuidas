@@ -22,6 +22,12 @@
 * Demo/fix/test SQL scripts are skipped for non-master roles (provision-role.sh filtering)
 * All 6 VMs (bdd-nodo01 through bdd-nodo06) exist and are currently provisioned and running
 * See `docs/08-spider-setup.md` for Spider architecture and troubleshooting
+* **Fase 14 — Spider coordinator config**: `log_bin=OFF`, `skip_slave_start=ON`, `read_only=OFF`, `bind-address=0.0.0.0`, `skip_name_resolve=ON`. Uses `60-coordinador.cnf` (not `60-replication.cnf`). Plugin loaded via `INSTALL SONAME 'ha_spider'` in SQL, not `plugin_load_add` in config.
+* **Spider user**: dedicated `spider_user@'192.168.56.106'` / `Spider_2025!` with `SELECT,INSERT,UPDATE,DELETE ON lab_bdd.*`, one per shard (principle of least privilege). Created in `05-vertical-fragment-*.sql`, not in `03-users.sql`.
+* **`detalle_pedidos` transparencia**: Sin columna `region` → dos tablas Spider simples (`spider_detalle_nodo04`, `spider_detalle_nodo05`) + VIEW `detalle_pedidos` con `UNION ALL`.
+* **Fragmentos verticales via Spider**: `v_productos_basico` (Spider → nodo04) y `v_productos_detalle` (Spider → nodo05). VIEW `productos` hace JOIN distribuido entre ambos.
+* **Vertical fragment SQL**: `05-vertical-fragment-a.sql` (nodo04: crea `v_productos_basico` + `spider_user`), `05-vertical-fragment-b.sql` (nodo05: crea `v_productos_detalle` + `spider_user`). Se ejecutan después de `04-fix-shard-schema.sql` por orden alfabético.
+* **`provision-role.sh` marker**: `MARKER="/var/lib/mysql/.provision-role-${ROLE}-complete"`. Para reprovisionar, borrar el marker vía SSH y ejecutar `vagrant provision`.
 
 ## Resumen de Fases 12–16
 
@@ -30,7 +36,7 @@
 
 * **Fase 13 — Fragmentación Horizontal**: Crea `bdd-nodo04` (Shard A: Norte/Este) y `bdd-nodo05` (Shard B: Sur/Oeste) como clones enlazados. Distribuye `clientes`, `pedidos` y `detalle_pedidos` por región usando `mysqldump --where`. Verifica completitud, disjunción y reconstrucción vía `UNION ALL`.
 
-* **Fase 14 — Fragmentación Vertical**: Distribuye `productos` verticalmente entre `nodo04` (columnas básicas) y `nodo05` (columnas de detalle). Provisiona `bdd-nodo06` con Spider como coordinador. Registra nodos remotos con `CREATE SERVER` y crea tablas Spider particionadas por `LIST COLUMNS (region)` con poda automática.
+* **Fase 14 — Fragmentación Vertical**: Distribuye `productos` verticalmente entre `nodo04` (columnas básicas) y `nodo05` (columnas de detalle). Provisiona `bdd-nodo06` con Spider como coordinador. Registra nodos remotos con `CREATE SERVER` y crea tablas Spider particionadas por `LIST COLUMNS (region)` con poda automática. `detalle_pedidos` usa dos tablas Spider simples + VIEW UNION ALL porque no tiene columna `region`. VIEW `productos` hace JOIN distribuido entre `v_productos_basico` (nodo04) y `v_productos_detalle` (nodo05).
 
 * **Fase 15 — Fragmentación Híbrida**: Optimiza consultas distribuidas con índices compuestos, empuje de predicados (predicate pushdown) y proyección de columnas. Crea la vista `reporte_pedidos_detallado` y el procedimiento `consulta_regional()` que encapsulan la distribución. Demuestra transparencia completa ante el cliente final.
 
